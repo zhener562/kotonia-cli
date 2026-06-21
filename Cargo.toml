@@ -1,0 +1,29 @@
+[package]
+name = "kotonia-cli"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Local shell agent backed by self-hosted or hosted LLMs (ReAct + native tool calling)."
+repository = "https://github.com/zhener562/kotonia-cli"
+homepage = "https://kotonia.ai"
+readme = "README.md"
+keywords = ["agent", "llm", "react", "cli", "tools"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "kotonia-cli"
+path = "src/main.rs"
+
+[dependencies]
+async-trait = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt", "process", "fs", "io-util", "io-std", "time", "sync"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"

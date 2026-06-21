@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""Local Searxng wrapper CLI for subagents / Codex shell tool.
+
+Usage:
+  web-search "<query>" [max_results=5] [lang=all]
+
+Outputs a human-readable list (title / url / snippet) of top results.
+Env: SEARXNG_URL (default http://127.0.0.1:8888).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+import urllib.parse
+import urllib.request
+
+
+def main() -> int:
+    if len(sys.argv) < 2 or not sys.argv[1].strip():
+        print('usage: web-search "<query>" [max_results=5] [lang=all]', file=sys.stderr)
+        return 2
+
+    query = sys.argv[1]
+    try:
+        max_results = int(sys.argv[2]) if len(sys.argv) > 2 else 5
+    except ValueError:
+        max_results = 5
+    lang = sys.argv[3] if len(sys.argv) > 3 else "all"
+    max_results = max(1, min(max_results, 30))
+
+    base = os.environ.get("SEARXNG_URL", "http://127.0.0.1:8888").rstrip("/")
+    qs = urllib.parse.urlencode({
+        "q": query,
+        "format": "json",
+        "language": lang,
+        "safesearch": "0",
+    })
+    url = f"{base}/search?{qs}"
+
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "web-search-cli/1.0",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.load(resp)
+    except Exception as e:  # noqa: BLE001 — surface any failure to caller
+        print(f"ERROR: search request failed: {e}", file=sys.stderr)
+        return 1
+
+    results = (data.get("results") or [])[:max_results]
+    if not results:
+        print(f"No results for: {query}")
+        return 0
+
+    print(f"Top {len(results)} results for: {query}\n")
+    for i, r in enumerate(results, 1):
+        title = (r.get("title") or "").strip()
+        href = (r.get("url") or "").strip()
+        snippet = (r.get("content") or "").strip()
+        print(f"[{i}] {title}")
+        print(f"    {href}")
+        if snippet:
+            print(f"    {snippet[:240]}")
+        print()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

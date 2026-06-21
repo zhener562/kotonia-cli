@@ -1,0 +1,94 @@
+#!/usr/bin/env python3
+"""fetch-url — extract a web page's main article body as Markdown.
+
+Wraps the `trafilatura` CLI (Mozilla Readability-class boilerplate stripper,
+better at JP/CJK than the original). Adds UTF-8 safe character truncation
+and a clear error message when extraction yields no usable content.
+
+Usage:
+  fetch-url <url> [max_chars]
+
+  max_chars=0 (or omitted) returns the full extracted body. Otherwise the
+  output is cut at `max_chars` code points and a `…[truncated]` marker is
+  appended.
+
+Env:
+  FETCH_URL_TRAFILATURA   override CLI path (default: `trafilatura` on PATH)
+  FETCH_URL_TIMEOUT       per-request timeout in seconds (default 45)
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import sys
+
+
+def main() -> int:
+    if len(sys.argv) < 2 or not sys.argv[1].strip():
+        print("usage: fetch-url <url> [max_chars]", file=sys.stderr)
+        return 2
+
+    url = sys.argv[1].strip()
+    try:
+        max_chars = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+    except ValueError:
+        max_chars = 0
+    if max_chars < 0:
+        max_chars = 0
+
+    try:
+        timeout = float(os.environ.get("FETCH_URL_TIMEOUT", "45"))
+    except ValueError:
+        timeout = 45.0
+
+    cli = os.environ.get("FETCH_URL_TRAFILATURA") or shutil.which("trafilatura")
+    if not cli:
+        print(
+            "ERROR: trafilatura CLI not found on PATH. "
+            "Install with: uv tool install trafilatura",
+            file=sys.stderr,
+        )
+        return 127
+
+    try:
+        result = subprocess.run(
+            [cli, "-u", url, "--no-comments", "--markdown"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"ERROR: fetch timed out ({timeout:g}s): {url}", file=sys.stderr)
+        return 1
+    except Exception as e:  # noqa: BLE001 — surface any failure to caller
+        print(f"ERROR: fetch failed: {e}", file=sys.stderr)
+        return 1
+
+    if result.returncode != 0:
+        msg = (result.stderr or result.stdout or "").strip() or f"exit {result.returncode}"
+        print(f"ERROR: trafilatura failed for {url}: {msg}", file=sys.stderr)
+        return 1
+
+    out = (result.stdout or "").strip()
+    if not out:
+        print(
+            f"ERROR: no extractable article content for {url} "
+            "(landing pages, JS-rendered SPAs, and paywalled pages often fail)",
+            file=sys.stderr,
+        )
+        return 1
+
+    if max_chars > 0 and len(out) > max_chars:
+        omitted = len(out) - max_chars
+        out = out[:max_chars] + f"\n\n…[truncated, {omitted} more chars omitted]"
+
+    sys.stdout.write(out)
+    if not out.endswith("\n"):
+        sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
