@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 pub enum ServerMsg {
     RunTask {
         task_id: String,
+        session_id: String,
         prompt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
     ApprovalResult {
         approval_id: String,

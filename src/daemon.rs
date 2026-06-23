@@ -18,10 +18,10 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex as AsyncMutex, RwLock};
 use tokio::task::block_in_place;
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::{
@@ -34,11 +34,20 @@ use crate::agent::agent::{
     Agent, AgentConfig, ApprovalHandler, ApprovalOutcome, Event, EventSink,
 };
 use crate::agent::approval::ApprovalMode;
+use crate::agent::history::{load_session_messages, HistoryStore};
 use crate::agent::provider::Provider;
 use crate::agent::wire::{DeviceMsg, ServerMsg, WireEvent};
 use crate::agent::worktree::AgentWorkspace;
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
+
+/// Sessions idle longer than this are GC'd: their worktree is removed and
+/// their conversation history is forgotten. 30 min matches a typical
+/// "stepped away from the chat" interval.
+const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// How often the GC task sweeps idle sessions.
+const SESSION_GC_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
@@ -61,6 +70,179 @@ pub struct DaemonConfig {
 /// arrives. `std::sync::Mutex` (not tokio) because the handler is sync.
 type PendingApprovals = Arc<Mutex<HashMap<String, std::sync::mpsc::Sender<bool>>>>;
 
+/// One running multi-turn session. Holds the live `Agent` (whose internal
+/// message history accumulates across `run_turn` calls) and the worktree
+/// it operates in.
+struct SessionState {
+    agent: Agent,
+    workspace: AgentWorkspace,
+    last_active: Instant,
+}
+
+/// Per-daemon-process session map. Survives WS reconnects so a flaky
+/// network doesn't lose conversation context. New sessions get a fresh
+/// worktree + provider; existing ones reuse them so follow-up tasks
+/// thread the prior context.
+struct SessionRegistry {
+    inner: RwLock<HashMap<String, Arc<AsyncMutex<SessionState>>>>,
+}
+
+impl SessionRegistry {
+    fn new() -> Self {
+        Self {
+            inner: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Look up or build a session. Returns the per-session async mutex so
+    /// the caller can lock it for the duration of `run_turn`.
+    ///
+    /// `model_override` lets the operator pick a different provider for a
+    /// *new* session via `/model` in the web console. Ignored on existing
+    /// sessions (the console regenerates session_id so this lands fresh).
+    /// Auto-resumes if a JSONL log already exists for the same session_id
+    /// in ~/.kotonia/sessions — operator can /resume across daemon restarts.
+    async fn get_or_create(
+        &self,
+        session_id: &str,
+        config: &DaemonConfig,
+        model_override: Option<&str>,
+    ) -> Result<Arc<AsyncMutex<SessionState>>, String> {
+        {
+            let map = self.inner.read().await;
+            if let Some(s) = map.get(session_id) {
+                return Ok(s.clone());
+            }
+        }
+        let model = model_override.unwrap_or(&config.model);
+        let provider = Provider::for_model(model)
+            .map_err(|e| format!("provider `{model}`: {e}"))?;
+        let launch_cwd =
+            std::env::current_dir().map_err(|e| format!("read cwd: {e}"))?;
+        let workspace = if config.in_place {
+            AgentWorkspace::in_place(launch_cwd)
+        } else {
+            AgentWorkspace::create_worktree(&launch_cwd, None)
+                .await
+                .map_err(|e| format!("worktree create: {e}"))?
+        };
+        let agent_config = AgentConfig::new(config.approval, config.in_place);
+        let mut agent = Agent::new(&workspace.root, provider, agent_config);
+
+        // Attach history persistence + auto-resume. The HistoryStore opens
+        // (or creates) ~/.kotonia/sessions/{session_id}.jsonl. If prior
+        // messages exist on disk, we seed the agent so /resume works
+        // transparently across daemon restarts.
+        match HistoryStore::open(session_id) {
+            Ok(mut store) => {
+                let prior = load_session_messages(session_id).unwrap_or_default();
+                let resuming = !prior.is_empty();
+                if !resuming {
+                    let label = agent.provider_label();
+                    let backend = if label.contains("(deepseek-api)") {
+                        "deepseek-api"
+                    } else if label.contains("(kotonia-api)") {
+                        "kotonia-api"
+                    } else {
+                        "local"
+                    };
+                    let _ = store.write_header(
+                        label.split_whitespace().next().unwrap_or(""),
+                        backend,
+                        &config.approval.to_string(),
+                        &workspace.root,
+                        config.in_place,
+                    );
+                }
+                agent = agent.with_history(store);
+                if resuming {
+                    eprintln!(
+                        "[daemon] session {} resumed from disk ({} prior msgs)",
+                        short(session_id),
+                        prior.len()
+                    );
+                    agent.seed_messages(prior);
+                } else {
+                    agent.log_initial_system();
+                }
+            }
+            Err(e) => {
+                eprintln!("[daemon] session {} history disabled: {e}", short(session_id));
+            }
+        }
+
+        let state = Arc::new(AsyncMutex::new(SessionState {
+            agent,
+            workspace,
+            last_active: Instant::now(),
+        }));
+
+        // Write-lock + check-and-insert: if another task raced us, return
+        // their session and drop ours (its workspace is a fresh /tmp dir
+        // that's harmless to leak transiently).
+        let mut map = self.inner.write().await;
+        if let Some(existing) = map.get(session_id) {
+            return Ok(existing.clone());
+        }
+        map.insert(session_id.to_string(), state.clone());
+        eprintln!("[daemon] session {} opened (model={})", short(session_id), model);
+        Ok(state)
+    }
+
+    /// Drop sessions idle longer than `idle`. Sessions currently in flight
+    /// (mutex locked) are skipped this round and retried next sweep.
+    async fn gc_idle(&self, idle: Duration) {
+        let now = Instant::now();
+
+        let candidates: Vec<String> = {
+            let map = self.inner.read().await;
+            map.iter()
+                .filter_map(|(id, state)| {
+                    state.try_lock().ok().and_then(|s| {
+                        if now.duration_since(s.last_active) > idle {
+                            Some(id.clone())
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect()
+        };
+
+        if candidates.is_empty() {
+            return;
+        }
+
+        let mut map = self.inner.write().await;
+        for id in candidates {
+            let Some(state_arc) = map.remove(&id) else {
+                continue;
+            };
+            match Arc::try_unwrap(state_arc) {
+                Ok(mutex) => {
+                    let state = mutex.into_inner();
+                    eprintln!("[daemon] session {} GC", short(&id));
+                    tokio::spawn(async move {
+                        if let Err(e) = state.workspace.cleanup(false).await {
+                            eprintln!("[daemon] worktree cleanup failed: {e}");
+                        }
+                    });
+                }
+                Err(arc) => {
+                    // Another task picked up a reference between our scan
+                    // and the write lock — put it back and retry next sweep.
+                    map.insert(id, arc);
+                }
+            }
+        }
+    }
+}
+
+fn short(id: &str) -> &str {
+    let n = id.char_indices().nth(8).map(|(i, _)| i).unwrap_or(id.len());
+    &id[..n]
+}
+
 /// Drive the daemon forever, reconnecting on transient errors. Returns
 /// only on unrecoverable config errors.
 pub async fn run(config: DaemonConfig) -> Result<(), String> {
@@ -74,8 +256,22 @@ pub async fn run(config: DaemonConfig) -> Result<(), String> {
         config.device_id, config.model, config.approval, config.in_place
     );
 
+    let registry = Arc::new(SessionRegistry::new());
+
+    // Background GC for idle sessions. Survives reconnects (lives at run()
+    // scope, not per-connection).
+    let gc_registry = registry.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(SESSION_GC_INTERVAL);
+        tick.tick().await; // skip immediate first tick
+        loop {
+            tick.tick().await;
+            gc_registry.gc_idle(SESSION_IDLE_TIMEOUT).await;
+        }
+    });
+
     loop {
-        match connect_and_pump(&ws_url, &bearer, &config).await {
+        match connect_and_pump(&ws_url, &bearer, &config, registry.clone()).await {
             Ok(()) => {
                 eprintln!("[daemon] connection closed cleanly, reconnecting in 5s");
             }
@@ -91,6 +287,7 @@ async fn connect_and_pump(
     ws_url: &str,
     bearer: &str,
     config: &DaemonConfig,
+    registry: Arc<SessionRegistry>,
 ) -> Result<(), String> {
     let mut request = ws_url
         .into_client_request()
@@ -166,12 +363,21 @@ async fn connect_and_pump(
                     );
                 }
             }
-            ServerMsg::RunTask { task_id, prompt } => {
+            ServerMsg::RunTask {
+                task_id,
+                session_id,
+                prompt,
+                model,
+            } => {
                 let pending = pending.clone();
                 let out_tx = out_tx.clone();
                 let config = config.clone();
+                let registry = registry.clone();
                 tokio::spawn(async move {
-                    run_agent_task(task_id, prompt, config, out_tx, pending).await;
+                    run_agent_task(
+                        task_id, session_id, prompt, model, config, registry, out_tx, pending,
+                    )
+                    .await;
                 });
             }
         }
@@ -185,43 +391,28 @@ async fn connect_and_pump(
 
 async fn run_agent_task(
     task_id: String,
+    session_id: String,
     prompt: String,
+    model: Option<String>,
     config: DaemonConfig,
+    registry: Arc<SessionRegistry>,
     out_tx: mpsc::UnboundedSender<DeviceMsg>,
     pending: PendingApprovals,
 ) {
-    // Provider build is the cheap, sync part — if it fails the operator's
-    // local model server is missing / mistyped, so surface that and bail.
-    let provider = match Provider::for_model(&config.model) {
-        Ok(p) => p,
+    let state_arc = match registry
+        .get_or_create(&session_id, &config, model.as_deref())
+        .await
+    {
+        Ok(s) => s,
         Err(e) => {
-            emit_error(&out_tx, &task_id, format!("provider `{}`: {e}", config.model));
+            emit_error(&out_tx, &task_id, e);
             return;
         }
     };
 
-    let launch_cwd = match std::env::current_dir() {
-        Ok(p) => p,
-        Err(e) => {
-            emit_error(&out_tx, &task_id, format!("read cwd: {e}"));
-            return;
-        }
-    };
-
-    let workspace = if config.in_place {
-        AgentWorkspace::in_place(launch_cwd)
-    } else {
-        match AgentWorkspace::create_worktree(&launch_cwd, None).await {
-            Ok(w) => w,
-            Err(e) => {
-                emit_error(&out_tx, &task_id, format!("worktree create: {e}"));
-                return;
-            }
-        }
-    };
-
-    let agent_config = AgentConfig::new(config.approval, config.in_place);
-    let mut agent = Agent::new(&workspace.root, provider, agent_config);
+    // Lock the session for the duration of this turn — sequential per
+    // session. Concurrent RunTasks for the same session queue up here.
+    let mut state = state_arc.lock().await;
 
     let mut sink = WsEventSink {
         task_id: task_id.clone(),
@@ -233,16 +424,10 @@ async fn run_agent_task(
         pending,
     };
 
-    // Agent emits Final + Done events via the sink, so we don't need to
-    // wrap the result here. We do log the AgentError variant for the
-    // daemon's stderr / journalctl trail.
-    if let Err(e) = agent.run_turn(&prompt, &mut approval, &mut sink).await {
+    if let Err(e) = state.agent.run_turn(&prompt, &mut approval, &mut sink).await {
         emit_error(&out_tx, &task_id, format!("agent: {e}"));
     }
-
-    if let Err(e) = workspace.cleanup(false).await {
-        eprintln!("[daemon] worktree cleanup for task {task_id} failed: {e}");
-    }
+    state.last_active = Instant::now();
 }
 
 fn emit_error(out_tx: &mpsc::UnboundedSender<DeviceMsg>, task_id: &str, message: String) {
