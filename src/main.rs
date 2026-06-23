@@ -30,7 +30,9 @@ use kotonia_cli::agent::approval::ApprovalMode;
 use kotonia_cli::agent::history::{list_sessions, load_session_messages, HistoryStore};
 use kotonia_cli::agent::provider::Provider;
 use kotonia_cli::agent::worktree::AgentWorkspace;
+use kotonia_cli::config as daemon_config;
 use kotonia_cli::daemon::{self, DaemonConfig};
+use kotonia_cli::login;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -51,30 +53,44 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Cmd {
+    /// Pair this machine with a kotonia.ai account via the OAuth-style
+    /// device-code flow: print a code, wait for the user to approve it from
+    /// a logged-in browser tab, then persist device_id + device_token to
+    /// ~/.kotonia/daemon.json so subsequent `daemon` runs need no flags.
+    Login(LoginArgs),
+
     /// Run as a long-lived WS daemon that streams agent tasks issued from
-    /// the paired kotonia.ai web UI. The device pairing flow (web prints a
-    /// 9-char code, daemon exchanges it for device_id + device_token) is a
-    /// separate prerequisite; this subcommand assumes those are already on
-    /// hand and just keeps a connection alive.
+    /// the paired kotonia.ai web UI. Reads credentials from
+    /// ~/.kotonia/daemon.json (written by `login`) if not supplied via
+    /// env / flag.
     Daemon(DaemonArgs),
+}
+
+#[derive(Args, Debug)]
+struct LoginArgs {
+    /// HTTP(S) base of the kotonia.ai backend to pair with.
+    #[arg(long, default_value = "https://kotonia.ai", env = "KOTONIA_API_BASE")]
+    server: String,
 }
 
 #[derive(Args, Debug)]
 struct DaemonArgs {
     /// HTTP(S) base of the kotonia.ai backend. WS endpoint is derived
-    /// (https → wss, http → ws) and the path is fixed.
-    #[arg(long, default_value = "https://kotonia.ai", env = "KOTONIA_API_BASE")]
-    server: String,
+    /// (https → wss, http → ws) and the path is fixed. Falls back to the
+    /// `server` field of ~/.kotonia/daemon.json if not set.
+    #[arg(long, env = "KOTONIA_API_BASE")]
+    server: Option<String>,
 
-    /// Device id the daemon was paired as. Must match a row in
-    /// agent_runtime_devices.device_id owned by the current user.
+    /// Device id the daemon was paired as. Falls back to
+    /// ~/.kotonia/daemon.json.
     #[arg(long, env = "KOTONIA_DEVICE_ID")]
-    device_id: String,
+    device_id: Option<String>,
 
-    /// Bearer token issued at pairing time. Sent as
-    /// `Authorization: Bearer <token>` on the WS upgrade.
+    /// Bearer token issued at pairing time. Falls back to
+    /// ~/.kotonia/daemon.json. Sent as `Authorization: Bearer <token>`
+    /// on the WS upgrade.
     #[arg(long, env = "KOTONIA_DEVICE_TOKEN", hide_env_values = true)]
-    device_token: String,
+    device_token: Option<String>,
 
     /// Model id for every task this daemon runs. Same surface as the
     /// one-shot CLI's `--model`. Default matches the one-shot default.
@@ -159,8 +175,10 @@ struct RunArgs {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
 
-    if let Some(Cmd::Daemon(args)) = cli.cmd {
-        return run_daemon(args).await;
+    match cli.cmd {
+        Some(Cmd::Daemon(args)) => return run_daemon(args).await,
+        Some(Cmd::Login(args)) => return run_login(args).await,
+        None => {}
     }
 
     let cli = cli.run;
@@ -440,10 +458,38 @@ async fn run_daemon(args: DaemonArgs) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+
+    // Resolve creds: flag/env > ~/.kotonia/daemon.json.
+    let stored = daemon_config::load();
+    let server = args
+        .server
+        .or_else(|| stored.as_ref().map(|c| c.server.clone()))
+        .unwrap_or_else(|| "https://kotonia.ai".to_string());
+    let device_id = match args
+        .device_id
+        .or_else(|| stored.as_ref().map(|c| c.device_id.clone()))
+    {
+        Some(v) => v,
+        None => {
+            eprintln!("kotonia-cli daemon: no device_id. Run `kotonia-cli login` first, or pass --device-id / KOTONIA_DEVICE_ID.");
+            return ExitCode::from(2);
+        }
+    };
+    let device_token = match args
+        .device_token
+        .or_else(|| stored.as_ref().map(|c| c.device_token.clone()))
+    {
+        Some(v) => v,
+        None => {
+            eprintln!("kotonia-cli daemon: no device_token. Run `kotonia-cli login` first, or pass --device-token / KOTONIA_DEVICE_TOKEN.");
+            return ExitCode::from(2);
+        }
+    };
+
     let config = DaemonConfig {
-        server: args.server,
-        device_id: args.device_id,
-        device_token: args.device_token,
+        server,
+        device_id,
+        device_token,
         model: args.model,
         approval,
         in_place: args.in_place,
@@ -452,6 +498,16 @@ async fn run_daemon(args: DaemonArgs) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("kotonia-cli daemon: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+async fn run_login(args: LoginArgs) -> ExitCode {
+    match login::run(&args.server).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("kotonia-cli login: {e}");
             ExitCode::from(1)
         }
     }

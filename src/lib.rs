@@ -8,5 +8,7 @@
 
 pub mod agent;
 pub mod ai;
+pub mod config;
 pub mod daemon;
 pub mod execution;
+pub mod login;
