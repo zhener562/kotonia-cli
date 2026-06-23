@@ -21,7 +21,7 @@
 use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
 
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 
 use kotonia_cli::agent::agent::{
     Agent, AgentConfig, ApprovalHandler, ApprovalOutcome, Event, EventSink,
@@ -30,6 +30,7 @@ use kotonia_cli::agent::approval::ApprovalMode;
 use kotonia_cli::agent::history::{list_sessions, load_session_messages, HistoryStore};
 use kotonia_cli::agent::provider::Provider;
 use kotonia_cli::agent::worktree::AgentWorkspace;
+use kotonia_cli::daemon::{self, DaemonConfig};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -38,6 +39,60 @@ use kotonia_cli::agent::worktree::AgentWorkspace;
     version
 )]
 struct Cli {
+    /// Optional subcommand. With no subcommand the rest of the args are
+    /// parsed as a one-shot / REPL task (the default kotonia-cli UX).
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
+
+    /// Args used when no subcommand is given.
+    #[command(flatten)]
+    run: RunArgs,
+}
+
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// Run as a long-lived WS daemon that streams agent tasks issued from
+    /// the paired kotonia.ai web UI. The device pairing flow (web prints a
+    /// 9-char code, daemon exchanges it for device_id + device_token) is a
+    /// separate prerequisite; this subcommand assumes those are already on
+    /// hand and just keeps a connection alive.
+    Daemon(DaemonArgs),
+}
+
+#[derive(Args, Debug)]
+struct DaemonArgs {
+    /// HTTP(S) base of the kotonia.ai backend. WS endpoint is derived
+    /// (https → wss, http → ws) and the path is fixed.
+    #[arg(long, default_value = "https://kotonia.ai", env = "KOTONIA_API_BASE")]
+    server: String,
+
+    /// Device id the daemon was paired as. Must match a row in
+    /// agent_runtime_devices.device_id owned by the current user.
+    #[arg(long, env = "KOTONIA_DEVICE_ID")]
+    device_id: String,
+
+    /// Bearer token issued at pairing time. Sent as
+    /// `Authorization: Bearer <token>` on the WS upgrade.
+    #[arg(long, env = "KOTONIA_DEVICE_TOKEN", hide_env_values = true)]
+    device_token: String,
+
+    /// Model id for every task this daemon runs. Same surface as the
+    /// one-shot CLI's `--model`. Default matches the one-shot default.
+    #[arg(long, default_value = "deepseek-v4-flash")]
+    model: String,
+
+    /// Approval policy. `all` / `allowlist` (default) / `auto`.
+    #[arg(long, default_value = "allowlist")]
+    approval: String,
+
+    /// Run agent tasks inside the daemon's cwd. Default is to create a
+    /// fresh git worktree per task (matches the one-shot CLI).
+    #[arg(long)]
+    in_place: bool,
+}
+
+#[derive(Args, Debug)]
+struct RunArgs {
     /// One-shot task description. Omit to enter the interactive REPL.
     prompt: Option<String>,
 
@@ -100,9 +155,15 @@ struct Cli {
     force_delimiter: bool,
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
+
+    if let Some(Cmd::Daemon(args)) = cli.cmd {
+        return run_daemon(args).await;
+    }
+
+    let cli = cli.run;
 
     if cli.list_sessions {
         return print_sessions_and_exit();
@@ -366,6 +427,34 @@ fn print_banner(
         eprintln!("  kotonia   : {base}/api/v1  (image/audio/video tools enabled)");
     }
     eprintln!("─────────────────────────────────────────────");
+}
+
+async fn run_daemon(args: DaemonArgs) -> ExitCode {
+    let approval = match ApprovalMode::parse(&args.approval) {
+        Some(m) => m,
+        None => {
+            eprintln!(
+                "kotonia-cli daemon: unknown approval mode `{}` (expected all|allowlist|auto)",
+                args.approval
+            );
+            return ExitCode::from(2);
+        }
+    };
+    let config = DaemonConfig {
+        server: args.server,
+        device_id: args.device_id,
+        device_token: args.device_token,
+        model: args.model,
+        approval,
+        in_place: args.in_place,
+    };
+    match daemon::run(config).await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("kotonia-cli daemon: {e}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn new_session_id() -> String {

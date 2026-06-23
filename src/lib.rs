@@ -8,4 +8,5 @@
 
 pub mod agent;
 pub mod ai;
+pub mod daemon;
 pub mod execution;

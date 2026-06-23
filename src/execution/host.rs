@@ -12,6 +12,9 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::time::timeout;
 
+/// Initial line buffer size for each stream. Larger lines just grow the Vec.
+const LINE_BUF_INITIAL: usize = 4096;
+
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
 const MAX_CAPTURE_BYTES: usize = 256 * 1024;
 
@@ -99,38 +102,45 @@ impl HostExecutor {
 
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
-        let mut stdout_lines = BufReader::new(stdout).lines();
-        let mut stderr_lines = BufReader::new(stderr).lines();
+        // `BufReader::lines()` would be tighter, but it does strict UTF-8
+        // decoding and dies when a shell command (e.g. `head -c N file.txt`)
+        // chops a multibyte char in the middle. Read raw bytes and decode
+        // lossily so the agent always sees something.
+        let mut stdout = BufReader::new(stdout);
+        let mut stderr = BufReader::new(stderr);
 
         let mut combined = String::new();
         let mut truncated = false;
 
         let drain = async {
-            loop {
+            let mut buf_out: Vec<u8> = Vec::with_capacity(LINE_BUF_INITIAL);
+            let mut buf_err: Vec<u8> = Vec::with_capacity(LINE_BUF_INITIAL);
+            let mut stdout_done = false;
+            let mut stderr_done = false;
+            while !(stdout_done && stderr_done) {
                 tokio::select! {
                     biased;
-                    line = stdout_lines.next_line() => {
-                        match line {
-                            Ok(Some(l)) => append_capped(&mut combined, &l, &mut truncated),
-                            Ok(None) => break,
+                    res = stdout.read_until(b'\n', &mut buf_out), if !stdout_done => {
+                        match res {
+                            Ok(0) => stdout_done = true,
+                            Ok(_) => {
+                                push_lossy_line(&mut combined, &buf_out, &mut truncated);
+                                buf_out.clear();
+                            }
                             Err(e) => return Err(HostExecutorError::Io(e)),
                         }
                     }
-                    line = stderr_lines.next_line() => {
-                        match line {
-                            Ok(Some(l)) => append_capped(&mut combined, &l, &mut truncated),
-                            Ok(None) => break,
+                    res = stderr.read_until(b'\n', &mut buf_err), if !stderr_done => {
+                        match res {
+                            Ok(0) => stderr_done = true,
+                            Ok(_) => {
+                                push_lossy_line(&mut combined, &buf_err, &mut truncated);
+                                buf_err.clear();
+                            }
                             Err(e) => return Err(HostExecutorError::Io(e)),
                         }
                     }
                 }
-            }
-            // Drain whichever stream is still open.
-            while let Ok(Some(l)) = stdout_lines.next_line().await {
-                append_capped(&mut combined, &l, &mut truncated);
-            }
-            while let Ok(Some(l)) = stderr_lines.next_line().await {
-                append_capped(&mut combined, &l, &mut truncated);
             }
             Ok::<(), HostExecutorError>(())
         };
@@ -158,6 +168,14 @@ impl HostExecutor {
             combined,
         })
     }
+}
+
+fn push_lossy_line(combined: &mut String, raw: &[u8], truncated: &mut bool) {
+    // Trim the trailing '\n' (kept by read_until) so append_capped only
+    // appends its own. CR stays for now — agents often want raw output.
+    let raw = raw.strip_suffix(b"\n").unwrap_or(raw);
+    let line = String::from_utf8_lossy(raw);
+    append_capped(combined, &line, truncated);
 }
 
 fn append_capped(buf: &mut String, line: &str, truncated: &mut bool) {
@@ -217,5 +235,21 @@ mod tests {
         let exec = HostExecutor::new("/tmp");
         let r = exec.bash("pwd").await.unwrap();
         assert!(r.combined.contains("/tmp"));
+    }
+
+    #[tokio::test]
+    async fn survives_invalid_utf8_split() {
+        // 「あ」 is 3 bytes in UTF-8 (0xE3 0x81 0x82). Cutting at 1 byte
+        // splits the multibyte char and the strict decoder would error;
+        // we want the lossy path to keep going and emit a replacement.
+        let exec = HostExecutor::new(std::env::temp_dir());
+        let r = exec
+            .bash("printf '\\xe3\\x81\\x82\\xe3\\x81\\x82' | head -c 1")
+            .await
+            .unwrap();
+        assert_eq!(r.exit_code, 0);
+        // No assertion on the exact replacement string — just that it
+        // doesn't fail and produces *some* output.
+        assert!(!r.combined.is_empty(), "lossy decode produced empty output");
     }
 }
