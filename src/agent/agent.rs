@@ -169,6 +169,19 @@ impl Agent {
         format!("{} ({})", self.provider.model_id(), self.provider.backend_label())
     }
 
+    /// Short tag of the provider backend (e.g. `kotonia` / `deepseek` /
+    /// a user-defined provider name). Use this when persisting metadata —
+    /// parsing `provider_label()` is fragile.
+    pub fn backend_label(&self) -> &str {
+        self.provider.backend_label()
+    }
+
+    /// Public model id of the active backend (e.g. `kotonia-gemma4-26b`,
+    /// `deepseek-chat:thinking`). For history headers / observability.
+    pub fn model_id(&self) -> &str {
+        self.provider.model_id()
+    }
+
     pub fn session_id(&self) -> Option<&str> {
         self.history.as_ref().map(|h| h.session_id.as_str())
     }

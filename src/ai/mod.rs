@@ -6,10 +6,7 @@
 //! the subset kotonia-cli uses (text + tool calling — no images, no
 //! Anthropic/Gemini adapters).
 
-pub mod deepseek;
-pub mod local_vllm;
-pub mod openai;
-pub(crate) mod openai_compat;
+pub mod openai_compat;
 
 use serde::{Deserialize, Serialize};
 use std::error::Error;

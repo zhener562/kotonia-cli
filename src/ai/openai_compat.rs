@@ -8,15 +8,15 @@ use super::{
 };
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum MaxTokensParam {
+pub enum MaxTokensParam {
     MaxTokens,
     MaxCompletionTokens,
     MaxOutputTokens,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct OpenAiCompatConfig {
-    pub api_base: &'static str,
+pub struct OpenAiCompatConfig {
+    pub api_base: String,
     pub api_key: String,
     pub model: Option<String>,
     pub max_tokens_param: MaxTokensParam,
@@ -28,13 +28,13 @@ pub(crate) struct OpenAiCompatConfig {
 }
 
 impl OpenAiCompatConfig {
-    pub(crate) fn new(
-        api_base: &'static str,
+    pub fn new(
+        api_base: impl Into<String>,
         api_key: impl Into<String>,
         max_tokens_param: MaxTokensParam,
     ) -> Self {
         Self {
-            api_base,
+            api_base: api_base.into(),
             api_key: api_key.into(),
             model: None,
             max_tokens_param,
@@ -47,13 +47,16 @@ impl OpenAiCompatConfig {
     }
 }
 
-pub(crate) async fn create_with_tools(
+pub async fn create_with_tools(
     client: &Client,
     config: OpenAiCompatConfig,
     messages: Vec<AiMessage>,
     options: AiCallOptions,
 ) -> Result<AiResponse, AiError> {
-    let url = format!("{}/chat/completions", config.api_base);
+    let url = format!(
+        "{}/chat/completions",
+        config.api_base.trim_end_matches('/')
+    );
     let body = build_request_body(config.clone(), messages, options)?;
 
     let mut req = client
