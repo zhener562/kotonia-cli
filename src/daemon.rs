@@ -40,6 +40,7 @@ use crate::agent::history::{load_session_messages, HistoryStore};
 use crate::agent::provider::Provider;
 use crate::agent::wire::{DeviceMsg, ServerMsg, WireEvent};
 use crate::agent::worktree::AgentWorkspace;
+use crate::notifier::{ApprovalDecision, ApprovalRequest, Notifier};
 
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
@@ -51,7 +52,18 @@ const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// How often the GC task sweeps idle sessions.
 const SESSION_GC_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
-#[derive(Debug, Clone)]
+/// How long an Approve from the notifier extends trust for a given
+/// browser_session_id. Renewed silently on every subsequent task.
+const TRUST_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Hard cap on how long the daemon waits for the operator to tap
+/// Approve/Deny in the notifier (Telegram/Discord). Generous enough for
+/// the operator to walk to their phone, tight enough that an attacker
+/// can't keep a task open indefinitely while trying to social-engineer
+/// the operator.
+const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
+
+#[derive(Clone)]
 pub struct DaemonConfig {
     /// HTTP(S) base URL of the kotonia.ai backend.
     pub server: String,
@@ -71,6 +83,12 @@ pub struct DaemonConfig {
     /// If true, agent runs in the operator's cwd; otherwise a fresh
     /// git worktree under /tmp/ is created per task (default).
     pub in_place: bool,
+    /// Phone-side approval channel. When set, every RunTask from an
+    /// un-trusted `browser_session_id` is gated through this notifier
+    /// (Telegram/Discord push → tap Approve/Deny → unblock the task).
+    /// When `None` the daemon trusts every incoming task — only safe with
+    /// `--no-notifier` opt-in.
+    pub notifier: Option<Arc<dyn Notifier>>,
 }
 
 /// Map of `approval_id → sync sender`. Inserted by [`WsApprovalHandler::ask`]
@@ -255,6 +273,45 @@ fn short(id: &str) -> &str {
     &id[..n]
 }
 
+/// In-memory record of which browser sessions the operator has approved
+/// via the notifier and when that trust lapses. Survives reconnects but
+/// not daemon restarts — on restart the operator re-confirms each tab
+/// once. (Persisting trust across restarts would require a real disk
+/// store and unlock a "stolen daemon.json keeps working forever" attack;
+/// reconfirmation is cheap and gives us a daily liveness check.)
+struct TrustStore {
+    inner: Mutex<HashMap<String, Instant>>,
+}
+
+impl TrustStore {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// True iff `id` is in the store and not yet expired. Expired entries
+    /// are removed lazily so the map stays small.
+    fn is_trusted(&self, id: &str) -> bool {
+        let now = Instant::now();
+        let mut map = self.inner.lock().unwrap();
+        match map.get(id) {
+            Some(deadline) if *deadline > now => true,
+            Some(_) => {
+                map.remove(id);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Extend (or open) trust for `id` by `TRUST_TTL` from now.
+    fn approve(&self, id: String) {
+        let mut map = self.inner.lock().unwrap();
+        map.insert(id, Instant::now() + TRUST_TTL);
+    }
+}
+
 /// Drive the daemon forever, reconnecting on transient errors. Returns
 /// only on unrecoverable config errors.
 pub async fn run(config: DaemonConfig) -> Result<(), String> {
@@ -264,11 +321,20 @@ pub async fn run(config: DaemonConfig) -> Result<(), String> {
     HeaderValue::from_str(&bearer).map_err(|e| format!("invalid bearer token: {e}"))?;
 
     eprintln!(
-        "[daemon] connecting to {ws_url}\n  device={}\n  model={}\n  approval={}\n  in_place={}",
-        config.device_id, config.model, config.approval, config.in_place
+        "[daemon] connecting to {ws_url}\n  device={}\n  model={}\n  approval={}\n  in_place={}\n  notifier={}",
+        config.device_id,
+        config.model,
+        config.approval,
+        config.in_place,
+        if config.notifier.is_some() {
+            "configured"
+        } else {
+            "DISABLED (--no-notifier)"
+        }
     );
 
     let registry = Arc::new(SessionRegistry::new());
+    let trust_store = Arc::new(TrustStore::new());
 
     // Background GC for idle sessions. Survives reconnects (lives at run()
     // scope, not per-connection).
@@ -283,7 +349,15 @@ pub async fn run(config: DaemonConfig) -> Result<(), String> {
     });
 
     loop {
-        match connect_and_pump(&ws_url, &bearer, &config, registry.clone()).await {
+        match connect_and_pump(
+            &ws_url,
+            &bearer,
+            &config,
+            registry.clone(),
+            trust_store.clone(),
+        )
+        .await
+        {
             Ok(()) => {
                 eprintln!("[daemon] connection closed cleanly, reconnecting in 5s");
             }
@@ -300,6 +374,7 @@ async fn connect_and_pump(
     bearer: &str,
     config: &DaemonConfig,
     registry: Arc<SessionRegistry>,
+    trust_store: Arc<TrustStore>,
 ) -> Result<(), String> {
     let mut request = ws_url
         .into_client_request()
@@ -380,16 +455,26 @@ async fn connect_and_pump(
                 session_id,
                 prompt,
                 model,
+                browser_session_id,
+                origin_ip,
+                user_agent,
             } => {
                 let pending = pending.clone();
                 let out_tx = out_tx.clone();
                 let config = config.clone();
                 let registry = registry.clone();
+                let trust_store = trust_store.clone();
+                let task = IncomingTask {
+                    task_id,
+                    session_id,
+                    prompt,
+                    model,
+                    browser_session_id,
+                    origin_ip,
+                    user_agent,
+                };
                 tokio::spawn(async move {
-                    run_agent_task(
-                        task_id, session_id, prompt, model, config, registry, out_tx, pending,
-                    )
-                    .await;
+                    run_agent_task(task, config, registry, trust_store, out_tx, pending).await;
                 });
             }
         }
@@ -401,16 +486,108 @@ async fn connect_and_pump(
     Ok(())
 }
 
-async fn run_agent_task(
+/// Everything we know about a freshly-arrived `RunTask` before deciding how
+/// to handle it. Kept as a single envelope so the approval gate (added in
+/// the next stage) and the agent itself can share the same shape without
+/// the function signature growing every time we add a piece of context.
+struct IncomingTask {
     task_id: String,
     session_id: String,
     prompt: String,
     model: Option<String>,
+    /// Web tab id the browser persisted in localStorage. `None` means the
+    /// backend didn't forward one — treat as "unknown origin".
+    browser_session_id: Option<String>,
+    origin_ip: Option<String>,
+    user_agent: Option<String>,
+}
+
+async fn run_agent_task(
+    task: IncomingTask,
     config: DaemonConfig,
     registry: Arc<SessionRegistry>,
+    trust_store: Arc<TrustStore>,
     out_tx: mpsc::UnboundedSender<DeviceMsg>,
     pending: PendingApprovals,
 ) {
+    let IncomingTask {
+        task_id,
+        session_id,
+        prompt,
+        model,
+        browser_session_id,
+        origin_ip,
+        user_agent,
+    } = task;
+
+    // ── Notifier gate ──────────────────────────────────────────────────
+    // If a notifier is configured, the task only proceeds when the caller's
+    // browser session is already trusted *or* the operator approves it via
+    // their phone right now. Without a browser_session_id we have no trust
+    // key to look up, so the gate falls through to "ask every time".
+    if let Some(notifier) = config.notifier.as_ref() {
+        let already_trusted = browser_session_id
+            .as_deref()
+            .map(|id| trust_store.is_trusted(id))
+            .unwrap_or(false);
+        if !already_trusted {
+            let req = ApprovalRequest {
+                browser_session_id: browser_session_id
+                    .clone()
+                    .unwrap_or_else(|| "<missing>".to_string()),
+                prompt_excerpt: prompt.chars().take(400).collect(),
+                origin_ip: origin_ip.clone(),
+                user_agent: user_agent.clone(),
+            };
+            match notifier.request_approval(req, APPROVAL_TIMEOUT).await {
+                Ok(ApprovalDecision::Approve) => {
+                    if let Some(id) = &browser_session_id {
+                        trust_store.approve(id.clone());
+                        eprintln!(
+                            "[daemon] browser session {} approved via notifier (24h trust)",
+                            short(id)
+                        );
+                    } else {
+                        // Approved but no key to remember — operator will be
+                        // asked again on the next task. Loud-log so it's
+                        // obvious the web UI is missing the id.
+                        eprintln!(
+                            "[daemon] task {} approved but no browser_session_id supplied — gate will fire again next task",
+                            short(&task_id)
+                        );
+                    }
+                }
+                Ok(ApprovalDecision::Deny) => {
+                    emit_error(
+                        &out_tx,
+                        &task_id,
+                        "task denied by operator via notifier".to_string(),
+                    );
+                    return;
+                }
+                Ok(ApprovalDecision::Timeout) => {
+                    emit_error(
+                        &out_tx,
+                        &task_id,
+                        format!(
+                            "notifier approval timed out after {}s — task rejected",
+                            APPROVAL_TIMEOUT.as_secs()
+                        ),
+                    );
+                    return;
+                }
+                Err(e) => {
+                    emit_error(
+                        &out_tx,
+                        &task_id,
+                        format!("notifier failed ({e}) — task rejected for safety"),
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
     let state_arc = match registry
         .get_or_create(&session_id, &config, model.as_deref())
         .await
@@ -525,6 +702,23 @@ fn http_to_ws_url(server: &str, device_id: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trust_store_grants_and_expires() {
+        let store = TrustStore::new();
+        assert!(!store.is_trusted("abc"));
+        store.approve("abc".to_string());
+        assert!(store.is_trusted("abc"));
+        // A stale entry: overwrite with a past deadline and confirm it's
+        // pruned on the next lookup.
+        store
+            .inner
+            .lock()
+            .unwrap()
+            .insert("stale".to_string(), Instant::now() - Duration::from_secs(1));
+        assert!(!store.is_trusted("stale"));
+        assert!(!store.inner.lock().unwrap().contains_key("stale"));
+    }
 
     #[test]
     fn http_to_ws_handles_both_schemes() {

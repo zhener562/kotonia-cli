@@ -15,6 +15,18 @@ pub enum ServerMsg {
         prompt: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+        /// Stable per-browser-tab id. Used as the trust key for the
+        /// notifier-gated approval flow. `None` means the caller (web UI or
+        /// other) didn't supply one, which the gate treats as "untrusted
+        /// origin" and requires fresh approval.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        browser_session_id: Option<String>,
+        /// Client IP the backend extracted (CF-Connecting-IP only).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin_ip: Option<String>,
+        /// First ~120 chars of the User-Agent header.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_agent: Option<String>,
     },
     ApprovalResult {
         approval_id: String,
