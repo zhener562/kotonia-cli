@@ -139,7 +139,12 @@ impl Notifier for TelegramNotifier {
         let body = serde_json::json!({
             "chat_id": self.chat_id,
             "text": text,
-            "parse_mode": "Markdown",
+            // HTML mode is more forgiving than Markdown — only `<`, `>`, `&`
+            // need escaping in user-supplied substrings (handled in
+            // `compose_request_text`), and stray backticks / asterisks in
+            // the operator's prompt won't break parsing the way they do in
+            // Markdown mode.
+            "parse_mode": "HTML",
             "reply_markup": {
                 "inline_keyboard": [[
                     {"text": "✅ Approve 24h", "callback_data": approve_data.clone()},
@@ -178,8 +183,8 @@ impl Notifier for TelegramNotifier {
                     .edit_message(
                         message_id,
                         &format!(
-                            "⏱️ Approval timed out for browser session `{}`.",
-                            short(&req.browser_session_id, 12)
+                            "⏱️ Approval timed out for browser session {}.",
+                            session_label(&req.browser_session_id)
                         ),
                     )
                     .await;
@@ -214,14 +219,15 @@ impl Notifier for TelegramNotifier {
                     .from
                     .and_then(|u| u.username.or(u.first_name))
                     .unwrap_or_else(|| "?".into());
+                let who_html = html_escape(&who);
                 let final_text = match d {
                     ApprovalDecision::Approve => format!(
-                        "✅ Approved by @{who} — browser session `{}` trusted for 24h.",
-                        short(&req.browser_session_id, 12)
+                        "✅ Approved by @{who_html} — browser session {} trusted for 24h.",
+                        session_label(&req.browser_session_id)
                     ),
                     ApprovalDecision::Deny => format!(
-                        "❌ Denied by @{who} — browser session `{}` blocked.",
-                        short(&req.browser_session_id, 12)
+                        "❌ Denied by @{who_html} — browser session {} blocked.",
+                        session_label(&req.browser_session_id)
                     ),
                     ApprovalDecision::Timeout => unreachable!(),
                 };
@@ -423,23 +429,63 @@ pub async fn pair(http: reqwest::Client) -> Result<NotifierStoredConfig, String>
 
 fn compose_request_text(req: &ApprovalRequest) -> String {
     let mut text = String::new();
-    text.push_str("🛡️ *Kotonia agent approval*\n\n");
-    text.push_str(&format!(
-        "New browser session: `{}`\n",
-        short(&req.browser_session_id, 12)
-    ));
+    text.push_str("🛡️ <b>Kotonia agent approval</b>\n\n");
+    match &req.browser_session_id {
+        Some(id) => {
+            text.push_str(&format!(
+                "New browser session: <code>{}</code>\n",
+                html_escape(&short(id, 12))
+            ));
+        }
+        None => {
+            // No id means the operator's frontend predates the localStorage
+            // integration. Approving still lets *this* task through, but
+            // there's no key to remember, so the gate will fire again next
+            // task. Call that out so the operator knows to redeploy/reload.
+            text.push_str(
+                "<i>⚠️ Web frontend did not send a browser session id — \
+                 approving this will <b>not</b> persist. Redeploy /agent or \
+                 hard-reload the page to get 24h-trust working.</i>\n",
+            );
+        }
+    }
     if let Some(ip) = &req.origin_ip {
-        text.push_str(&format!("Origin IP: `{ip}`\n"));
+        text.push_str(&format!(
+            "Origin IP: <code>{}</code>\n",
+            html_escape(ip)
+        ));
     }
     if let Some(ua) = &req.user_agent {
-        text.push_str(&format!("Browser: {}\n", short(ua, 80)));
+        text.push_str(&format!("Browser: {}\n", html_escape(&short(ua, 80))));
     }
     text.push_str("\nFirst prompt:\n");
-    text.push_str("```\n");
-    text.push_str(&short(&req.prompt_excerpt, 400));
-    text.push_str("\n```\n");
-    text.push_str("\nApprove this browser session for 24h?");
+    text.push_str("<pre>");
+    text.push_str(&html_escape(&short(&req.prompt_excerpt, 400)));
+    text.push_str("</pre>\n");
+    text.push_str("\nApprove this caller for the next 24h?");
     text
+}
+
+/// Render a session id (or its absence) for the Telegram message — used in
+/// the request, timeout, and final-edit lines.
+fn session_label(id: &Option<String>) -> String {
+    match id {
+        Some(s) => format!("<code>{}</code>", html_escape(&short(s, 12))),
+        None => "<i>(unknown — frontend missing browser_session_id)</i>".to_string(),
+    }
+}
+
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 fn short(s: &str, n: usize) -> String {
@@ -459,7 +505,7 @@ mod tests {
     #[test]
     fn compose_includes_session_and_prompt() {
         let req = ApprovalRequest {
-            browser_session_id: "abc12345-67890-very-long".into(),
+            browser_session_id: Some("abc12345-67890-very-long".into()),
             prompt_excerpt: "list files".into(),
             origin_ip: Some("203.0.113.5".into()),
             user_agent: Some("Mozilla/5.0".into()),
@@ -468,6 +514,39 @@ mod tests {
         assert!(text.contains("abc12345"));
         assert!(text.contains("list files"));
         assert!(text.contains("203.0.113.5"));
+    }
+
+    #[test]
+    fn compose_warns_when_session_id_missing() {
+        // Old `/agent` frontends predate the localStorage integration and
+        // don't send a browser_session_id. The notifier message has to
+        // surface that so the operator knows approval won't persist.
+        let req = ApprovalRequest {
+            browser_session_id: None,
+            prompt_excerpt: "list files".into(),
+            origin_ip: None,
+            user_agent: None,
+        };
+        let text = compose_request_text(&req);
+        assert!(text.to_ascii_lowercase().contains("did not send"));
+        assert!(text.contains("Redeploy") || text.contains("redeploy") || text.contains("reload"));
+    }
+
+    #[test]
+    fn compose_escapes_html_in_prompt() {
+        // A prompt full of HTML metachars must not break the message. The
+        // earlier Markdown mode crashed on stray backticks; HTML mode only
+        // needs `<`, `>`, `&` escaped — verify that's actually happening.
+        let req = ApprovalRequest {
+            browser_session_id: Some("s".into()),
+            prompt_excerpt: "</pre><script>alert('x')</script> & co".into(),
+            origin_ip: None,
+            user_agent: None,
+        };
+        let text = compose_request_text(&req);
+        assert!(!text.contains("<script>"));
+        assert!(text.contains("&lt;script&gt;"));
+        assert!(text.contains("&amp;"));
     }
 
     #[test]

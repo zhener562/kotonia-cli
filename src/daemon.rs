@@ -532,9 +532,7 @@ async fn run_agent_task(
             .unwrap_or(false);
         if !already_trusted {
             let req = ApprovalRequest {
-                browser_session_id: browser_session_id
-                    .clone()
-                    .unwrap_or_else(|| "<missing>".to_string()),
+                browser_session_id: browser_session_id.clone(),
                 prompt_excerpt: prompt.chars().take(400).collect(),
                 origin_ip: origin_ip.clone(),
                 user_agent: user_agent.clone(),
