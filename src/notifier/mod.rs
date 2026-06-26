@@ -46,9 +46,12 @@ pub struct NotifierStoredConfig {
 /// What the daemon asks the operator to approve.
 #[derive(Debug, Clone)]
 pub struct ApprovalRequest {
-    /// The browser session whose first task we're gating. Same value the
-    /// browser persists in `localStorage`.
-    pub browser_session_id: String,
+    /// The browser session whose first task we're gating. `None` means the
+    /// web frontend didn't include one — typically because the operator is
+    /// hitting an older `/agent` page that predates the localStorage
+    /// integration. The notifier surfaces that explicitly so the operator
+    /// knows to redeploy/reload before approval can persist.
+    pub browser_session_id: Option<String>,
     /// First ~200 chars of the prompt — enough for the operator to decide
     /// "yeah, that's me" vs "what is this?". Truncated upstream.
     pub prompt_excerpt: String,
