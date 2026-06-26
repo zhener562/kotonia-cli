@@ -1,17 +1,16 @@
-//! kotonia-cli — local shell agent backed by a self-hosted LLM.
+//! kotonia-cli — local shell agent backed by a hosted or self-hosted LLM.
 //!
-//! Model backends:
-//!   - `deepseek-v4-flash`        (default) — local llama.cpp on :8898
-//!   - `gemma4-26b-uncensored`    local vLLM on :8899 (native tool calling)
-//!   - `deepseek-chat`            DeepSeek API (V4-Flash class, native tools)
-//!   - `deepseek-reasoner`        DeepSeek API (V4-Pro reasoning, native tools)
-//!   - `kotonia-v4-flash`         remote — hits kotonia.ai /api/v1 chat
-//!   - `kotonia-gemma4-26b`       remote — kotonia.ai /api/v1 chat (native tools)
+//! Built-in providers (resolved by model id):
+//!   - `kotonia-gemma4-26b` (default) — kotonia.ai /api/v1 chat (native tools)
+//!   - `deepseek-chat`                — DeepSeek API (native tools)
+//!   - `deepseek-reasoner`            — DeepSeek API (reasoning, native tools)
 //!
-//! Backends that advertise OpenAI-compatible `tools` are driven via native
-//! tool calling (`bash`, `web_search`). V4-Flash on llama.cpp falls back to
-//! the legacy `<<<BASH>>>` delimiter loop because the build has no
-//! `--tool-call-parser`.
+//! Custom providers can be added via `~/.kotonia/providers.json` and selected
+//! with `--provider <name> --model <id>` (any OpenAI-compatible endpoint).
+//!
+//! All built-in backends drive the model via native OpenAI-compatible tool
+//! calling (`bash`, `web_search`, `fetch_url`). The legacy `<<<BASH>>>`
+//! delimiter loop is reachable through `--force-delimiter` for debugging.
 //!
 //! When called with a prompt argument the CLI runs one task and exits.
 //! When called with no prompt it drops into an interactive REPL — each
@@ -27,6 +26,8 @@ use kotonia_cli::agent::agent::{
     Agent, AgentConfig, ApprovalHandler, ApprovalOutcome, Event, EventSink,
 };
 use kotonia_cli::agent::approval::ApprovalMode;
+use kotonia_cli::agent::claude_code::ClaudeCodeAgent;
+use kotonia_cli::agent::dispatch::DispatchAgent;
 use kotonia_cli::agent::history::{list_sessions, load_session_messages, HistoryStore};
 use kotonia_cli::agent::provider::Provider;
 use kotonia_cli::agent::worktree::AgentWorkspace;
@@ -94,8 +95,19 @@ struct DaemonArgs {
 
     /// Model id for every task this daemon runs. Same surface as the
     /// one-shot CLI's `--model`. Default matches the one-shot default.
-    #[arg(long, default_value = "deepseek-v4-flash")]
+    #[arg(long, default_value = "kotonia-gemma4-26b")]
     model: String,
+
+    /// Explicit provider name (`kotonia`, `deepseek`, or any entry from
+    /// `~/.kotonia/providers.json`). When omitted the provider is inferred
+    /// from the model id.
+    #[arg(long)]
+    provider: Option<String>,
+
+    /// Agent engine: `react` (default) or `claude-code`. Also selected
+    /// automatically when `--model claude-code` is passed.
+    #[arg(long, default_value = "react")]
+    engine: String,
 
     /// Approval policy. `all` / `allowlist` (default) / `auto`.
     #[arg(long, default_value = "allowlist")]
@@ -112,11 +124,27 @@ struct RunArgs {
     /// One-shot task description. Omit to enter the interactive REPL.
     prompt: Option<String>,
 
-    /// Model id. Local: `deepseek-v4-flash`, `gemma4-26b-uncensored`.
-    /// DeepSeek API: `deepseek-chat`, `deepseek-reasoner` (with optional
-    /// `:thinking` suffix). Requires DEEPSEEK_API_KEY for the API routes.
-    #[arg(short, long, default_value = "deepseek-v4-flash")]
+    /// Model id. Defaults to the hosted `kotonia-gemma4-26b` (requires
+    /// `kotonia-cli login`). DeepSeek API: `deepseek-chat`,
+    /// `deepseek-reasoner` (with optional `:thinking` suffix, needs
+    /// `DEEPSEEK_API_KEY`). Custom providers come from
+    /// `~/.kotonia/providers.json` and are selected via `--provider`.
+    #[arg(short, long, default_value = "kotonia-gemma4-26b")]
     model: String,
+
+    /// Explicit provider name (`kotonia`, `deepseek`, or any entry from
+    /// `~/.kotonia/providers.json`). When omitted the provider is inferred
+    /// from the model id; falls back to the default provider for unknown
+    /// model ids.
+    #[arg(long)]
+    provider: Option<String>,
+
+    /// Agent engine: `react` (default — kotonia-cli's own ReAct loop over a
+    /// provider) or `claude-code` (drive the local `claude` binary as a
+    /// subprocess in headless stream-json mode). Also selected automatically
+    /// when `--model claude-code` is passed.
+    #[arg(long, default_value = "react")]
+    engine: String,
 
     /// Approval mode: `all` gates every command, `allowlist` (default) auto-runs
     /// read-only / build / test families and gates anything destructive,
@@ -198,12 +226,18 @@ async fn main() -> ExitCode {
         }
     };
 
-    let provider = match Provider::for_model(&cli.model) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("kotonia-cli: cannot use model `{}`: {e}", cli.model);
-            return ExitCode::from(2);
-        }
+    // Decide engine: explicit `--engine` wins, otherwise `--model claude-code`
+    // also selects the Claude Code subprocess engine for ergonomics.
+    let engine_choice = if cli.engine == "claude-code" || cli.model == "claude-code" {
+        EngineChoice::ClaudeCode
+    } else if cli.engine == "react" {
+        EngineChoice::ReAct
+    } else {
+        eprintln!(
+            "kotonia-cli: unknown engine `{}` (expected react|claude-code)",
+            cli.engine
+        );
+        return ExitCode::from(2);
     };
 
     let launch_cwd = match std::env::current_dir() {
@@ -227,47 +261,64 @@ async fn main() -> ExitCode {
         }
     };
 
-    let mut config = AgentConfig::new(approval_mode, cli.in_place);
-    config.max_iterations = cli.max_iterations;
-    config.force_delimiter = cli.force_delimiter;
-    // Surface kotonia /api/v1 (image/audio/video) only when the operator
-    // exported KOTONIA_API_KEY. The key passes through bash naturally
-    // (Command inherits env); we just gate the prompt section so the
-    // model doesn't try to call an API it has no credentials for.
-    config.kotonia_api_base = if std::env::var("KOTONIA_API_KEY").is_ok() {
-        Some(
-            std::env::var("KOTONIA_API_BASE")
-                .unwrap_or_else(|_| "https://kotonia.ai".to_string()),
-        )
-    } else {
-        None
-    };
-    let kotonia_api_enabled = config.kotonia_api_base.is_some();
-    let mut agent = Agent::new(&workspace.root, provider, config);
-
-    // Wire history persistence + resume.
+    // Resolve session_id up front; the ClaudeCode engine needs it for
+    // `--session-id` / `--resume`, and the ReAct path uses it for history.
     let session_id = cli
         .session
         .clone()
         .or_else(|| cli.resume.clone())
         .unwrap_or_else(new_session_id);
 
+    // The kotonia /api/v1 helper banner only applies to the ReAct prompt
+    // (the model is told it can shell out to the API). ClaudeCode runs its
+    // own tool surface, so we suppress this for that engine.
+    let kotonia_api_enabled = matches!(engine_choice, EngineChoice::ReAct)
+        && std::env::var("KOTONIA_API_KEY").is_ok();
+
+    let mut agent = match engine_choice {
+        EngineChoice::ReAct => {
+            let provider = match Provider::resolve(cli.provider.as_deref(), &cli.model) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("kotonia-cli: cannot use model `{}`: {e}", cli.model);
+                    return ExitCode::from(2);
+                }
+            };
+            let mut config = AgentConfig::new(approval_mode, cli.in_place);
+            config.max_iterations = cli.max_iterations;
+            config.force_delimiter = cli.force_delimiter;
+            config.kotonia_api_base = if std::env::var("KOTONIA_API_KEY").is_ok() {
+                Some(
+                    std::env::var("KOTONIA_API_BASE")
+                        .unwrap_or_else(|_| "https://kotonia.ai".to_string()),
+                )
+            } else {
+                None
+            };
+            DispatchAgent::ReAct(Agent::new(&workspace.root, provider, config))
+        }
+        EngineChoice::ClaudeCode => {
+            // The Claude Code session id must be a UUID; the host's compact
+            // timestamp ids don't qualify, so coerce on first use.
+            let claude_session_id =
+                kotonia_cli::agent::claude_code::claude_code_session_id(&session_id);
+            DispatchAgent::ClaudeCode(ClaudeCodeAgent::new(
+                &workspace.root,
+                claude_session_id,
+                cli.in_place,
+            ))
+        }
+    };
+
+    // Wire history persistence + resume.
     if !cli.no_history {
         match HistoryStore::open(&session_id) {
             Ok(mut store) => {
                 let is_resume = cli.resume.is_some();
                 if !is_resume {
-                    let label = agent.provider_label();
-                    let backend = if label.contains("(deepseek-api)") {
-                        "deepseek-api"
-                    } else if label.contains("(kotonia-api)") {
-                        "kotonia-api"
-                    } else {
-                        "local"
-                    };
                     let _ = store.write_header(
-                        label.split_whitespace().next().unwrap_or(""),
-                        backend,
+                        agent.model_id(),
+                        agent.backend_label(),
                         &approval_mode.to_string(),
                         &workspace.root,
                         cli.in_place,
@@ -339,10 +390,10 @@ async fn main() -> ExitCode {
 }
 
 async fn repl(
-    agent: &mut Agent,
+    agent: &mut DispatchAgent,
     approval: &mut StdioApproval,
     sink: &mut StdoutSink,
-) -> Result<String, kotonia_cli::agent::agent::AgentError> {
+) -> Result<String, kotonia_cli::agent::dispatch::DispatchError> {
     eprintln!("(interactive — empty line / `exit` / Ctrl-D to quit)");
     let stdin = io::stdin();
     let mut last_answer = String::new();
@@ -412,7 +463,7 @@ async fn cleanup_workspace(workspace: AgentWorkspace, keep: bool, quiet: bool) {
 fn print_banner(
     workspace: &AgentWorkspace,
     approval: ApprovalMode,
-    agent: &Agent,
+    agent: &DispatchAgent,
     kotonia_api: bool,
 ) {
     eprintln!("─────────────────────────────────────────────");
@@ -491,6 +542,8 @@ async fn run_daemon(args: DaemonArgs) -> ExitCode {
         device_id,
         device_token,
         model: args.model,
+        provider: args.provider,
+        engine: args.engine,
         approval,
         in_place: args.in_place,
     };
@@ -520,6 +573,12 @@ fn new_session_id() -> String {
     let stamp = now.format("%Y%m%d-%H%M%S");
     let rnd: String = uuid::Uuid::new_v4().to_string().chars().take(4).collect();
     format!("{stamp}-{rnd}")
+}
+
+#[derive(Clone, Copy, Debug)]
+enum EngineChoice {
+    ReAct,
+    ClaudeCode,
 }
 
 fn print_sessions_and_exit() -> ExitCode {

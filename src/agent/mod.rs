@@ -1,5 +1,7 @@
 pub mod agent;
 pub mod approval;
+pub mod claude_code;
+pub mod dispatch;
 pub mod history;
 pub mod parse;
 pub mod prompt;

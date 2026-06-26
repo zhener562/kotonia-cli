@@ -34,6 +34,8 @@ use crate::agent::agent::{
     Agent, AgentConfig, ApprovalHandler, ApprovalOutcome, Event, EventSink,
 };
 use crate::agent::approval::ApprovalMode;
+use crate::agent::claude_code::ClaudeCodeAgent;
+use crate::agent::dispatch::DispatchAgent;
 use crate::agent::history::{load_session_messages, HistoryStore};
 use crate::agent::provider::Provider;
 use crate::agent::wire::{DeviceMsg, ServerMsg, WireEvent};
@@ -55,9 +57,15 @@ pub struct DaemonConfig {
     pub server: String,
     pub device_id: String,
     pub device_token: String,
-    /// Model id passed through to [`Provider::for_model`] when a RunTask
+    /// Model id passed through to [`Provider::resolve`] when a RunTask
     /// arrives. Default matches the one-shot CLI's `--model` default.
     pub model: String,
+    /// Optional provider override; None means infer from model id.
+    pub provider: Option<String>,
+    /// Agent engine string: `"react"` or `"claude-code"`. Same surface as
+    /// the one-shot CLI's `--engine` — `"claude-code"` makes the daemon
+    /// drive the local `claude` binary as a subprocess per task.
+    pub engine: String,
     /// Approval policy applied to every agent task this daemon runs.
     pub approval: ApprovalMode,
     /// If true, agent runs in the operator's cwd; otherwise a fresh
@@ -70,11 +78,12 @@ pub struct DaemonConfig {
 /// arrives. `std::sync::Mutex` (not tokio) because the handler is sync.
 type PendingApprovals = Arc<Mutex<HashMap<String, std::sync::mpsc::Sender<bool>>>>;
 
-/// One running multi-turn session. Holds the live `Agent` (whose internal
-/// message history accumulates across `run_turn` calls) and the worktree
-/// it operates in.
+/// One running multi-turn session. Holds the live agent (whose internal
+/// state accumulates across `run_turn` calls) and the worktree it operates
+/// in. `DispatchAgent` is an engine-agnostic envelope around either a
+/// kotonia ReAct loop or a Claude Code subprocess.
 struct SessionState {
-    agent: Agent,
+    agent: DispatchAgent,
     workspace: AgentWorkspace,
     last_active: Instant,
 }
@@ -115,8 +124,7 @@ impl SessionRegistry {
             }
         }
         let model = model_override.unwrap_or(&config.model);
-        let provider = Provider::for_model(model)
-            .map_err(|e| format!("provider `{model}`: {e}"))?;
+        let use_claude_code = config.engine == "claude-code" || model == "claude-code";
         let launch_cwd =
             std::env::current_dir().map_err(|e| format!("read cwd: {e}"))?;
         let workspace = if config.in_place {
@@ -126,8 +134,20 @@ impl SessionRegistry {
                 .await
                 .map_err(|e| format!("worktree create: {e}"))?
         };
-        let agent_config = AgentConfig::new(config.approval, config.in_place);
-        let mut agent = Agent::new(&workspace.root, provider, agent_config);
+        let mut agent = if use_claude_code {
+            let cc_session_id =
+                crate::agent::claude_code::claude_code_session_id(session_id);
+            DispatchAgent::ClaudeCode(ClaudeCodeAgent::new(
+                &workspace.root,
+                cc_session_id,
+                config.in_place,
+            ))
+        } else {
+            let provider = Provider::resolve(config.provider.as_deref(), model)
+                .map_err(|e| format!("provider `{model}`: {e}"))?;
+            let agent_config = AgentConfig::new(config.approval, config.in_place);
+            DispatchAgent::ReAct(Agent::new(&workspace.root, provider, agent_config))
+        };
 
         // Attach history persistence + auto-resume. The HistoryStore opens
         // (or creates) ~/.kotonia/sessions/{session_id}.jsonl. If prior
@@ -138,17 +158,9 @@ impl SessionRegistry {
                 let prior = load_session_messages(session_id).unwrap_or_default();
                 let resuming = !prior.is_empty();
                 if !resuming {
-                    let label = agent.provider_label();
-                    let backend = if label.contains("(deepseek-api)") {
-                        "deepseek-api"
-                    } else if label.contains("(kotonia-api)") {
-                        "kotonia-api"
-                    } else {
-                        "local"
-                    };
                     let _ = store.write_header(
-                        label.split_whitespace().next().unwrap_or(""),
-                        backend,
+                        agent.model_id(),
+                        agent.backend_label(),
                         &config.approval.to_string(),
                         &workspace.root,
                         config.in_place,

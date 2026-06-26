@@ -1,17 +1,21 @@
 # kotonia-cli
 
-A local shell agent driven by self-hosted or hosted LLMs. ReAct-style loop
-with **native tool calling** on models that support it (Gemma 4 26B
-Uncensored, DeepSeek API, kotonia hosted API) and a delimiter-based
-fallback on models that don't (DeepSeek-V4-Flash on `llama.cpp`).
+A local shell agent driven by hosted or self-hosted LLMs. Two engines:
 
-It runs commands on your machine through `bash`, searches the web through
-a local Searxng instance, and extracts article bodies with `trafilatura`.
+- **ReAct** — kotonia-cli's own loop over any OpenAI-compatible
+  `/chat/completions` endpoint. Native tool calling (`bash` /
+  `web_search` / `fetch_url`). Built-in shortcuts for the
+  [kotonia.ai](https://kotonia.ai) hosted API and the DeepSeek API;
+  custom providers via `~/.kotonia/providers.json`.
+- **Claude Code** — drives the local `claude` binary as a subprocess in
+  headless `stream-json` mode. Lets a daemon on your machine serve "act
+  as if I'm running `claude` from this shell" UX over a WS to the
+  kotonia.ai `/agent` web console.
 
 ```
 ─────────────────────────────────────────────
 kotonia-cli
-  model     : gemma4-26b-uncensored (local)
+  model     : kotonia-gemma4-26b (kotonia)
   tools     : native (bash + web_search + fetch_url)
   approval  : allowlist
   workspace : /tmp/kotonia-agent-xyz  (worktree)
@@ -19,8 +23,6 @@ kotonia-cli
 ```
 
 ## Install
-
-### Build from source
 
 ```sh
 git clone https://github.com/zhener562/kotonia-cli
@@ -56,44 +58,114 @@ Dependencies:
 Both tools degrade gracefully — `kotonia-cli` will keep working without
 them; only the matching tool call will return an error to the model.
 
-## Model backends
+## Authentication
 
-`kotonia-cli` picks the backend from the `--model` id:
+`kotonia-cli login` pairs your machine with a kotonia.ai account via an
+OAuth-style device-code flow:
 
-| `--model`                  | Backend                              | Tool calling |
-| -------------------------- | ------------------------------------ | ------------ |
-| `deepseek-v4-flash`        | local llama.cpp on `:8898`           | delimiter    |
-| `gemma4-26b-uncensored`    | local vLLM on `:8899`                | native       |
-| `deepseek-chat`            | DeepSeek API (V4-Flash class)        | native       |
-| `deepseek-reasoner`        | DeepSeek API (V4-Pro reasoning)      | native       |
-| `kotonia-v4-flash`         | hosted — kotonia.ai `/api/v1/chat`   | delimiter    |
-| `kotonia-gemma4-26b`       | hosted — kotonia.ai `/api/v1/chat`   | native       |
+```sh
+kotonia-cli login
+# prints a URL + code; approve from a logged-in browser tab.
+# Writes ~/.kotonia/daemon.json {server, device_id, device_token}.
+```
 
-The hosted route requires `KOTONIA_API_KEY` (mint at
-<https://kotonia.ai/api-manager>). The DeepSeek API route requires
-`DEEPSEEK_API_KEY`. The local routes assume the matching server is up on
-the listed port — there's a smoke note in [`docs/local-servers.md`].
+The stored `device_token` is reused as the bearer for **both** the
+daemon WS and the public `/api/v1/*` API — one login covers both
+surfaces. You can still mint a separate `kotonia_…` API key at
+<https://kotonia.ai/api-manager> if you want a key that's not bound to a
+paired device.
+
+For the DeepSeek-hosted API, set `DEEPSEEK_API_KEY` in your env.
+
+## Model providers
+
+`--model` picks the model id; `--provider` (optional) forces a specific
+provider. When `--provider` is omitted the provider is inferred from the
+model id.
+
+Built-in providers:
+
+| `--provider` | Endpoint                       | Default model         | Auth                              |
+| ------------ | ------------------------------ | --------------------- | --------------------------------- |
+| `kotonia`    | kotonia.ai `/api/v1`           | `kotonia-gemma4-26b`  | `KOTONIA_API_KEY` or `daemon.json` device_token |
+| `deepseek`   | api.deepseek.com               | `deepseek-chat`       | `DEEPSEEK_API_KEY`                |
+
+DeepSeek's `:thinking` suffix on `deepseek-chat:thinking` /
+`deepseek-reasoner:thinking` is forwarded as the upstream `thinking` +
+`reasoning_effort` body knob.
+
+### Custom providers (`~/.kotonia/providers.json`)
+
+Any OpenAI-compatible endpoint can be added without code changes. Example:
+
+```json
+{
+  "providers": {
+    "openai": {
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": "OPENAI_API_KEY",
+      "default_model": "gpt-5",
+      "max_tokens_param": "max_completion_tokens",
+      "models": ["gpt-5", "gpt-4.1"]
+    },
+    "local-llama": {
+      "base_url": "http://127.0.0.1:8080/v1",
+      "default_model": "llama-3.3-70b"
+    }
+  }
+}
+```
+
+Then:
+
+```sh
+kotonia-cli --provider openai --model gpt-5 "summarise main.rs"
+kotonia-cli --provider local-llama "what does router.rs do?"
+```
+
+The `models` array lets you skip `--provider` for those ids
+(`kotonia-cli --model gpt-5 ...` infers `openai`).
 
 ## Usage
 
 ```sh
-# One-shot
+# One-shot ReAct (defaults to kotonia-gemma4-26b)
 kotonia-cli "explain the http error handling in src/router.rs"
 
-# Interactive REPL (no prompt argument)
+# Interactive REPL
 kotonia-cli
 
-# Switch backend
-kotonia-cli --model kotonia-gemma4-26b "summarise the README"
+# Switch model / provider
+kotonia-cli --model deepseek-reasoner:thinking "design a rate limiter"
+kotonia-cli --provider openai --model gpt-5 "summarise the README"
+
+# Claude Code engine — drive the local `claude` binary headlessly
+kotonia-cli --engine claude-code "explain main.rs"
 
 # Resume a prior session
 kotonia-cli --list-sessions
 kotonia-cli --resume 20260621-205141-9c4a
 ```
 
+### Daemon mode
+
+After `kotonia-cli login`, run the daemon to expose your machine to the
+kotonia.ai `/agent` web console:
+
+```sh
+kotonia-cli daemon                       # default model + ReAct
+kotonia-cli daemon --engine claude-code  # remote Claude Code
+kotonia-cli daemon --in-place            # don't create a worktree per task
+```
+
+Tasks issued from the web UI stream `Event`s back over WS (iteration
+ticks, tool invocations, observations, final answers, errors).
+
 ### Approval modes
 
-`--approval` controls how `bash` commands are gated:
+`--approval` controls how `bash` commands are gated in the **ReAct**
+engine. The Claude Code engine ignores this and runs with
+`--dangerously-skip-permissions` (trust the worktree boundary):
 
 - **`all`** — every command pops a `[y/N]` prompt before running.
 - **`allowlist`** (default) — read-only / build / test families run
@@ -110,13 +182,13 @@ explicitly merge.
 
 Pass `--in-place` to disable that and run inside your launch `cwd`.
 
-## Building the agent
+## The ReAct loop
 
-The agent loop runs `iter ← provider call → tool dispatch → observation`
-until the model returns a final answer or hits `--max-iterations`. On
-native-tool backends each iteration is a single `tools` round-trip; on
-delimiter backends each iteration parses one `<<<BASH>>>` or
-`<<<FINAL_ANSWER>>>` block out of the model's free text.
+Each iteration is `provider call → tool dispatch → observation` until
+the model returns a final answer or hits `--max-iterations`. Native
+tool calling is the default; pass `--force-delimiter` to drive a model
+through the legacy `<<<BASH>>>` / `<<<FINAL_ANSWER>>>` text loop (debug
+hook).
 
 The tool catalogue is intentionally tiny:
 
