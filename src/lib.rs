@@ -12,4 +12,5 @@ pub mod config;
 pub mod daemon;
 pub mod execution;
 pub mod login;
+pub mod notifier;
 pub mod providers;

@@ -34,6 +34,7 @@ use kotonia_cli::agent::worktree::AgentWorkspace;
 use kotonia_cli::config as daemon_config;
 use kotonia_cli::daemon::{self, DaemonConfig};
 use kotonia_cli::login;
+use kotonia_cli::notifier;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -65,6 +66,12 @@ enum Cmd {
     /// ~/.kotonia/daemon.json (written by `login`) if not supplied via
     /// env / flag.
     Daemon(DaemonArgs),
+
+    /// Pair this machine with a third-party messaging app (Telegram for
+    /// now) so the daemon can ask for phone confirmation before trusting a
+    /// new browser session. The approval channel is independent of
+    /// kotonia.ai — a compromised backend cannot forge an approve signal.
+    PairNotifier(PairNotifierArgs),
 }
 
 #[derive(Args, Debug)]
@@ -72,6 +79,13 @@ struct LoginArgs {
     /// HTTP(S) base of the kotonia.ai backend to pair with.
     #[arg(long, default_value = "https://kotonia.ai", env = "KOTONIA_API_BASE")]
     server: String,
+}
+
+#[derive(Args, Debug)]
+struct PairNotifierArgs {
+    /// Notifier kind. `telegram` is the only supported value today; `discord`
+    /// is planned in a follow-up.
+    kind: String,
 }
 
 #[derive(Args, Debug)]
@@ -117,6 +131,14 @@ struct DaemonArgs {
     /// fresh git worktree per task (matches the one-shot CLI).
     #[arg(long)]
     in_place: bool,
+
+    /// Opt out of the phone-side approval channel (Telegram/Discord) for
+    /// new browser sessions. Without this flag the daemon refuses to start
+    /// unless `kotonia-cli pair-notifier <telegram|discord>` has been run.
+    /// Only safe if you fully trust the kotonia.ai backend AND every web
+    /// session that drives this daemon — i.e. local-only experiments.
+    #[arg(long)]
+    no_notifier: bool,
 }
 
 #[derive(Args, Debug)]
@@ -206,6 +228,7 @@ async fn main() -> ExitCode {
     match cli.cmd {
         Some(Cmd::Daemon(args)) => return run_daemon(args).await,
         Some(Cmd::Login(args)) => return run_login(args).await,
+        Some(Cmd::PairNotifier(args)) => return run_pair_notifier(args).await,
         None => {}
     }
 
@@ -537,6 +560,60 @@ async fn run_daemon(args: DaemonArgs) -> ExitCode {
         }
     };
 
+    // ── Notifier resolve ──────────────────────────────────────────────
+    // Foolproof default: refuse to start without a paired notifier. The
+    // operator must either run `pair-notifier` or explicitly opt out.
+    let notifier = match (notifier::load_notifier_config(), args.no_notifier) {
+        (Some(stored_notifier), _) => {
+            let http = match reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("kotonia-cli daemon: http client: {e}");
+                    return ExitCode::from(1);
+                }
+            };
+            let n = notifier::build_notifier(&stored_notifier, http);
+            match n.ping().await {
+                Ok(name) => {
+                    eprintln!("[daemon] notifier verified: @{name}");
+                }
+                Err(e) => {
+                    eprintln!(
+                        "kotonia-cli daemon: notifier ping failed ({e}). Fix the bot token \
+                         in ~/.kotonia/notifier.json or re-run `kotonia-cli pair-notifier`."
+                    );
+                    return ExitCode::from(1);
+                }
+            }
+            Some(n)
+        }
+        (None, true) => {
+            eprintln!(
+                "[daemon] WARNING: --no-notifier set; every task runs without phone \
+                 confirmation. If the kotonia.ai backend is compromised the attacker \
+                 can drive this daemon at will."
+            );
+            None
+        }
+        (None, false) => {
+            eprintln!(
+                "kotonia-cli daemon: no approval channel configured.\n\n\
+                 For safety the daemon refuses to start without one — if our backend is \
+                 compromised, an attacker could otherwise run arbitrary commands on this \
+                 machine.\n\n\
+                 Set one up with:\n\
+                     kotonia-cli pair-notifier telegram\n\n\
+                 Or, only if you fully trust both kotonia.ai and every browser that drives \
+                 this daemon, opt out explicitly:\n\
+                     kotonia-cli daemon --no-notifier"
+            );
+            return ExitCode::from(2);
+        }
+    };
+
     let config = DaemonConfig {
         server,
         device_id,
@@ -546,6 +623,7 @@ async fn run_daemon(args: DaemonArgs) -> ExitCode {
         engine: args.engine,
         approval,
         in_place: args.in_place,
+        notifier,
     };
     match daemon::run(config).await {
         Ok(()) => ExitCode::SUCCESS,
@@ -561,6 +639,53 @@ async fn run_login(args: LoginArgs) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("kotonia-cli login: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+async fn run_pair_notifier(args: PairNotifierArgs) -> ExitCode {
+    let http = match reqwest::Client::builder()
+        // Default timeout. Long-poll calls supply their own per-request timeouts.
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("kotonia-cli pair-notifier: http client: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let cfg = match args.kind.to_ascii_lowercase().as_str() {
+        "telegram" | "tg" => match notifier::telegram::pair(http).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("kotonia-cli pair-notifier: {e}");
+                return ExitCode::from(1);
+            }
+        },
+        "discord" => {
+            eprintln!("kotonia-cli pair-notifier: discord support is planned but not implemented yet.");
+            return ExitCode::from(2);
+        }
+        other => {
+            eprintln!(
+                "kotonia-cli pair-notifier: unknown notifier kind `{other}` (expected telegram)"
+            );
+            return ExitCode::from(2);
+        }
+    };
+    match notifier::save_notifier_config(&cfg) {
+        Ok(path) => {
+            eprintln!();
+            eprintln!("Saved notifier config to {}", path.display());
+            eprintln!();
+            eprintln!("Next: start the daemon with `kotonia-cli daemon`. It will gate every");
+            eprintln!("new browser session through your Telegram bot for 24h trust.");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("kotonia-cli pair-notifier: save config: {e}");
             ExitCode::from(1)
         }
     }

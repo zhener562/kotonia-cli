@@ -77,6 +77,38 @@ paired device.
 
 For the DeepSeek-hosted API, set `DEEPSEEK_API_KEY` in your env.
 
+## Approval channel (phone confirm)
+
+When you run the daemon, kotonia.ai can drive your machine through it.
+That's the point — but it also means a future compromise of kotonia.ai
+would let an attacker run arbitrary commands here. To make that
+structurally impossible, `kotonia-cli daemon` gates every first task
+from a new browser session through an **independent push-notification
+channel** (Telegram today; Discord planned). The bot token lives on
+*your* machine; kotonia.ai never sees it; an attacker who owns the
+backend still can't forge an Approve.
+
+```sh
+kotonia-cli pair-notifier telegram
+```
+
+The flow:
+
+1. In Telegram, message `@BotFather` → `/newbot` → follow prompts → copy the
+   bot token.
+2. Paste the token at the `kotonia-cli pair-notifier` prompt.
+3. The CLI prints a one-time pairing code. Open your new bot in Telegram
+   and send `/start <CODE>`.
+4. Done — `~/.kotonia/notifier.json` now holds `{bot_token, chat_id}` at
+   0600 perms.
+
+Once paired, every first task from a new browser tab sends an Approve /
+Deny prompt to your phone. Approving extends 24h of silent trust for
+that tab; subsequent tasks run with no prompt. The daemon **refuses to
+start** without a paired notifier — pass `--no-notifier` only if you
+fully trust both kotonia.ai and every browser session that drives this
+daemon.
+
 ## Model providers
 
 `--model` picks the model id; `--provider` (optional) forces a specific
@@ -149,17 +181,21 @@ kotonia-cli --resume 20260621-205141-9c4a
 
 ### Daemon mode
 
-After `kotonia-cli login`, run the daemon to expose your machine to the
-kotonia.ai `/agent` web console:
+After `kotonia-cli login` **and** `kotonia-cli pair-notifier telegram`
+(see [Approval channel](#approval-channel-phone-confirm)), run the
+daemon to expose your machine to the kotonia.ai `/agent` web console:
 
 ```sh
 kotonia-cli daemon                       # default model + ReAct
 kotonia-cli daemon --engine claude-code  # remote Claude Code
 kotonia-cli daemon --in-place            # don't create a worktree per task
+kotonia-cli daemon --no-notifier         # opt out of phone confirm (dangerous)
 ```
 
 Tasks issued from the web UI stream `Event`s back over WS (iteration
-ticks, tool invocations, observations, final answers, errors).
+ticks, tool invocations, observations, final answers, errors). The
+first task from each new browser tab triggers a Telegram push asking
+you to approve the session for 24h.
 
 ### Approval modes
 
