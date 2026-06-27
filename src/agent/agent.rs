@@ -77,6 +77,12 @@ pub struct AgentConfig {
     /// native `tools` calling. Useful for diffing / debugging when the
     /// native path misbehaves.
     pub force_delimiter: bool,
+    /// Persona-level system prompt prefix. Prepended verbatim to the
+    /// agent's tool-aware base prompt, separated by a `---` block, so
+    /// downstream consumers (kotonia-desktop's Iris character) can give
+    /// the agent a voice / personality without forking the base prompt.
+    /// Leave `None` for the plain CLI/daemon experience.
+    pub persona_prefix: Option<String>,
 }
 
 impl AgentConfig {
@@ -88,6 +94,7 @@ impl AgentConfig {
             in_place,
             kotonia_api_base: None,
             force_delimiter: false,
+            persona_prefix: None,
         }
     }
 }
@@ -121,10 +128,16 @@ impl Agent {
         let executor = HostExecutor::new(workspace_root.to_path_buf());
         let native_mode = provider.supports_native_tools() && !config.force_delimiter;
         let kotonia_base = config.kotonia_api_base.as_deref();
-        let system_prompt_text = if native_mode {
+        let base_prompt = if native_mode {
             system_prompt_native(workspace_root, config.in_place, kotonia_base)
         } else {
             system_prompt(workspace_root, config.in_place, kotonia_base)
+        };
+        let system_prompt_text = match config.persona_prefix.as_deref() {
+            Some(prefix) if !prefix.trim().is_empty() => {
+                format!("{}\n\n---\n\n{}", prefix.trim(), base_prompt)
+            }
+            _ => base_prompt,
         };
         let messages = vec![ChatMsg::system(system_prompt_text.clone())];
         let tool_catalog = if native_mode { build_tool_catalog() } else { Vec::new() };
