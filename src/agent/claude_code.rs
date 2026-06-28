@@ -133,7 +133,12 @@ impl ClaudeCodeEngine {
             .current_dir(&self.config.workspace_root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // Ensures `Child` drop sends SIGKILL. The desktop's cancel
+            // button aborts the surrounding tokio task, which drops this
+            // `Child` — without `kill_on_drop` the subprocess would
+            // happily keep running until completion, defeating cancel.
+            .kill_on_drop(true);
         if self.first_turn {
             cmd.arg("--session-id").arg(&self.config.session_id);
         } else {
@@ -168,12 +173,10 @@ impl ClaudeCodeEngine {
         let mut reader = BufReader::new(stdout).lines();
         let mut iteration = 0u32;
         let mut final_text: Option<String> = None;
-        // The `result` event carries the last assistant text, but it
-        // arrives only at the end. Track the in-progress text so a caller
-        // who's just streaming events still sees content immediately.
-        // (We don't currently emit incremental text — we batch one
-        // `LlmThinking` per assistant turn — but the field is here so
-        // future stages can emit prefix tokens.)
+        // Last assistant text block we forwarded as `Event::Text`. Used to
+        // dedupe the `result` event, which always carries the final text
+        // — if we already streamed it, emit `Final` as a marker only.
+        let mut last_streamed_text: Option<String> = None;
         let _ = &mut iteration;
 
         while let Some(line) = reader
@@ -223,17 +226,16 @@ impl ClaudeCodeEngine {
                                     .get("text")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("");
-                                if !text.trim().is_empty() && !had_text {
-                                    sink.emit(Event::LlmThinking);
-                                    had_text = true;
+                                if !text.trim().is_empty() {
+                                    if !had_text {
+                                        sink.emit(Event::LlmThinking);
+                                        had_text = true;
+                                    }
+                                    sink.emit(Event::Text {
+                                        text: text.to_string(),
+                                    });
+                                    last_streamed_text = Some(text.to_string());
                                 }
-                                // The `result` event below carries the
-                                // canonical final answer. Emitting Final
-                                // here too would deliver it twice (the
-                                // earlier draft did this to stream prose
-                                // to the web UI as it arrives — that's a
-                                // job for a dedicated streaming event,
-                                // not Final).
                             }
                             Some("tool_use") => {
                                 let name = block
@@ -299,8 +301,20 @@ impl ClaudeCodeEngine {
                             },
                         });
                     } else {
+                        // Avoid replaying the final text under `Final` when
+                        // we already streamed the same content as `Text`.
+                        // Emit `Final` with empty body in that case so the
+                        // renderer still gets its turn-end separator.
+                        let already_streamed = last_streamed_text
+                            .as_deref()
+                            .map(|s| s == result_text.as_str())
+                            .unwrap_or(false);
                         sink.emit(Event::Final {
-                            answer: result_text.clone(),
+                            answer: if already_streamed {
+                                String::new()
+                            } else {
+                                result_text.clone()
+                            },
                         });
                     }
                     final_text = Some(result_text);
@@ -355,18 +369,183 @@ impl ClaudeCodeEngine {
     }
 }
 
-/// Render a Claude tool invocation as a single shell-style line so the
-/// host's `Event::Bash` rendering ("$ <cmd>") still makes sense. Bash gets
-/// passed through verbatim; other tools get a `[<name>] <args-json>`
-/// summary so the operator can see what's happening.
+/// Render a Claude tool invocation as a shell-style block so the host's
+/// `Event::Bash` rendering ("$ <cmd>") still makes sense. Bash passes
+/// through verbatim. File-mutating tools (`Edit` / `Write` / `MultiEdit` /
+/// `NotebookEdit`) get a hand-rolled diff/preview so the operator sees
+/// what's about to change — the TUI shows colored diffs here and dropping
+/// to `[Edit] {raw-JSON}` was the biggest readability cliff vs interactive
+/// Claude Code. Anything else still falls back to `[<name>] <args>`.
 fn render_tool_invocation(name: &str, input: &Value) -> String {
-    if name == "Bash" {
-        if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
-            return cmd.to_string();
+    match name {
+        "Bash" => {
+            if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
+                return cmd.to_string();
+            }
         }
+        "Edit" => return render_edit(input),
+        "Write" => return render_write(input),
+        "MultiEdit" => return render_multi_edit(input),
+        "NotebookEdit" => return render_notebook_edit(input),
+        _ => {}
     }
     let args = serde_json::to_string(input).unwrap_or_else(|_| "{}".into());
     format!("[{name}] {args}")
+}
+
+/// Max lines kept per side of a diff hunk. Beyond this, append "…(N more)".
+/// Keeps the log readable when Claude rewrites a 500-line file.
+const DIFF_MAX_LINES_PER_SIDE: usize = 12;
+/// Max preview lines for `Write`'s full-file payload.
+const WRITE_MAX_PREVIEW_LINES: usize = 16;
+
+fn render_edit(input: &Value) -> String {
+    let path = input
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let old_s = input
+        .get("old_string")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let new_s = input
+        .get("new_string")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let replace_all = input
+        .get("replace_all")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let header = if replace_all {
+        format!("[Edit] {path} (replace_all)")
+    } else {
+        format!("[Edit] {path}")
+    };
+    format!("{header}\n{}", diff_block(old_s, new_s))
+}
+
+fn render_write(input: &Value) -> String {
+    let path = input
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let content = input
+        .get("content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let total_lines = content.lines().count();
+    let bytes = content.len();
+    let mut out = format!("[Write] {path} ({bytes} bytes, {total_lines} lines)");
+    if content.is_empty() {
+        return out;
+    }
+    out.push('\n');
+    let mut shown = 0usize;
+    for line in content.lines().take(WRITE_MAX_PREVIEW_LINES) {
+        out.push('|');
+        out.push(' ');
+        out.push_str(line);
+        out.push('\n');
+        shown += 1;
+    }
+    if shown < total_lines {
+        out.push_str(&format!("…({} more lines)", total_lines - shown));
+    } else {
+        out.pop(); // trailing newline
+    }
+    out
+}
+
+fn render_multi_edit(input: &Value) -> String {
+    let path = input
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let edits = input
+        .get("edits")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut out = format!("[MultiEdit] {path} ({} edit{})",
+        edits.len(),
+        if edits.len() == 1 { "" } else { "s" });
+    for (i, edit) in edits.iter().enumerate() {
+        let old_s = edit
+            .get("old_string")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let new_s = edit
+            .get("new_string")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        out.push_str(&format!("\n── edit {} ──\n", i + 1));
+        out.push_str(&diff_block(old_s, new_s));
+    }
+    out
+}
+
+fn render_notebook_edit(input: &Value) -> String {
+    let path = input
+        .get("notebook_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let cell_id = input
+        .get("cell_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let mode = input
+        .get("edit_mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("replace");
+    let new_src = input
+        .get("new_source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let old_src = input
+        .get("old_source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    format!(
+        "[NotebookEdit] {path} (cell {cell_id}, {mode})\n{}",
+        diff_block(old_src, new_src)
+    )
+}
+
+/// Format a before/after pair as a `-`/`+` block, capped at
+/// `DIFF_MAX_LINES_PER_SIDE` per side. Not a real LCS diff — that's
+/// overkill for the visibility goal and adds a dep. The intent is
+/// "operator can see roughly what's changing without opening an editor."
+fn diff_block(old_s: &str, new_s: &str) -> String {
+    let mut out = String::new();
+    let old_lines: Vec<&str> = old_s.lines().collect();
+    let new_lines: Vec<&str> = new_s.lines().collect();
+    for line in old_lines.iter().take(DIFF_MAX_LINES_PER_SIDE) {
+        out.push_str("- ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    if old_lines.len() > DIFF_MAX_LINES_PER_SIDE {
+        out.push_str(&format!(
+            "…({} more removed lines)\n",
+            old_lines.len() - DIFF_MAX_LINES_PER_SIDE
+        ));
+    }
+    for line in new_lines.iter().take(DIFF_MAX_LINES_PER_SIDE) {
+        out.push_str("+ ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    if new_lines.len() > DIFF_MAX_LINES_PER_SIDE {
+        out.push_str(&format!(
+            "…({} more added lines)\n",
+            new_lines.len() - DIFF_MAX_LINES_PER_SIDE
+        ));
+    }
+    // Trim the final newline so callers can compose without a blank tail.
+    if out.ends_with('\n') {
+        out.pop();
+    }
+    out
 }
 
 /// Tool result `content` can be either a plain string or an array of
@@ -517,6 +696,81 @@ mod tests {
         let out = render_tool_invocation("Read", &input);
         assert!(out.starts_with("[Read]"));
         assert!(out.contains("/tmp/x"));
+    }
+
+    #[test]
+    fn render_edit_shows_diff_lines() {
+        let input = serde_json::json!({
+            "file_path": "/tmp/foo.rs",
+            "old_string": "let x = 1;\nlet y = 2;",
+            "new_string": "let x = 11;\nlet y = 2;",
+        });
+        let out = render_tool_invocation("Edit", &input);
+        assert!(out.starts_with("[Edit] /tmp/foo.rs"));
+        assert!(out.contains("- let x = 1;"));
+        assert!(out.contains("+ let x = 11;"));
+    }
+
+    #[test]
+    fn render_edit_caps_long_payloads() {
+        let big_old: String = (0..50)
+            .map(|i| format!("old line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let big_new: String = (0..50)
+            .map(|i| format!("new line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let input = serde_json::json!({
+            "file_path": "/tmp/big",
+            "old_string": big_old,
+            "new_string": big_new,
+        });
+        let out = render_tool_invocation("Edit", &input);
+        assert!(out.contains("more removed lines"));
+        assert!(out.contains("more added lines"));
+    }
+
+    #[test]
+    fn render_write_shows_preview() {
+        let input = serde_json::json!({
+            "file_path": "/tmp/out.txt",
+            "content": "hello\nworld",
+        });
+        let out = render_tool_invocation("Write", &input);
+        assert!(out.starts_with("[Write] /tmp/out.txt"));
+        assert!(out.contains("| hello"));
+        assert!(out.contains("| world"));
+    }
+
+    #[test]
+    fn render_multi_edit_lists_each_edit() {
+        let input = serde_json::json!({
+            "file_path": "/tmp/multi.rs",
+            "edits": [
+                {"old_string": "a", "new_string": "A"},
+                {"old_string": "b", "new_string": "B"},
+            ],
+        });
+        let out = render_tool_invocation("MultiEdit", &input);
+        assert!(out.starts_with("[MultiEdit] /tmp/multi.rs (2 edits)"));
+        assert!(out.contains("── edit 1 ──"));
+        assert!(out.contains("── edit 2 ──"));
+        assert!(out.contains("- a"));
+        assert!(out.contains("+ B"));
+    }
+
+    #[test]
+    fn render_notebook_edit_includes_cell_and_mode() {
+        let input = serde_json::json!({
+            "notebook_path": "/tmp/nb.ipynb",
+            "cell_id": "abc123",
+            "edit_mode": "insert",
+            "new_source": "print('hi')",
+        });
+        let out = render_tool_invocation("NotebookEdit", &input);
+        assert!(out.starts_with("[NotebookEdit] /tmp/nb.ipynb (cell abc123, insert)"));
+        assert!(out.contains("+ print('hi')"));
     }
 
     #[test]

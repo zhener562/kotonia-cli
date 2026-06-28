@@ -59,6 +59,12 @@ pub enum WireEvent {
         max: u32,
     },
     LlmThinking,
+    /// Streaming prose chunk from the model (Claude Code engine today).
+    /// Renderers should append, not replace; `Final` will NOT replay the
+    /// same content when it's already been streamed via `Text`.
+    Text {
+        text: String,
+    },
     Bash {
         command: String,
     },
@@ -94,6 +100,7 @@ impl WireEvent {
         match event {
             Event::IterationStart { iteration, max } => Self::IterationStart { iteration, max },
             Event::LlmThinking => Self::LlmThinking,
+            Event::Text { text } => Self::Text { text },
             Event::Bash { command } => Self::Bash { command },
             Event::BashSkipped { command, reason } => Self::BashSkipped { command, reason },
             Event::Observation { result } => Self::Observation {
