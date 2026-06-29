@@ -60,6 +60,14 @@ pub enum Event {
     Bash { command: String },
     BashSkipped { command: String, reason: String },
     Observation { result: ExecutionResult },
+    /// Fires when the agent calls `inspect_image`. `error: None` on success
+    /// (the image was loaded and attached to the next user turn); `Some(msg)`
+    /// when the read failed (missing file, oversized, unsupported type).
+    InspectImage {
+        path: String,
+        size_bytes: u64,
+        error: Option<String>,
+    },
     Final { answer: String },
     Malformed { excerpt: String },
     Error { message: String },
@@ -126,6 +134,12 @@ pub struct Agent {
     /// hydrated from `messages` on first `run_turn` so resumed sessions
     /// keep their text-only context.
     native_messages: Vec<AiMessage>,
+    /// Tools like `inspect_image` need to deliver non-text content (an
+    /// `Image` block) to the model, but the OpenAI-compat `tool` role is
+    /// text-only by spec. Such tools push a synthetic `user` message in
+    /// here; the agent loop drains the queue right after the tool-role
+    /// message is appended, so the assistant's next turn sees both.
+    pending_user_followups: Vec<AiMessage>,
     history: Option<HistoryStore>,
 }
 
@@ -156,6 +170,7 @@ impl Agent {
             system_prompt: system_prompt_text,
             messages,
             native_messages: Vec::new(),
+            pending_user_followups: Vec::new(),
             history: None,
         }
     }
@@ -498,6 +513,15 @@ impl Agent {
                 role: AiRole::Tool,
                 content: tool_result_blocks,
             });
+            // Multimodal tools (inspect_image today) queue a follow-up
+            // user message carrying the image content. Drain right after
+            // the tool message so message order is:
+            //   assistant(tool_call) → tool(text ack) → user(image)
+            // which is the contract every OpenAI-compat backend with
+            // vision support handles cleanly.
+            for follow_up in self.pending_user_followups.drain(..) {
+                self.native_messages.push(follow_up);
+            }
         }
 
         sink.emit(Event::Done {
@@ -671,13 +695,124 @@ impl Agent {
                 let is_error = result.exit_code != 0 || result.timed_out;
                 Ok((result.as_observation(), is_error))
             }
+            "inspect_image" => {
+                let path = input
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if path.trim().is_empty() {
+                    sink.emit(Event::InspectImage {
+                        path: String::new(),
+                        size_bytes: 0,
+                        error: Some("empty path".into()),
+                    });
+                    return Ok(("inspect_image called with empty `path`".into(), true));
+                }
+                match self.read_image_for_inspection(&path) {
+                    Ok((media_type, data, size_bytes)) => {
+                        sink.emit(Event::InspectImage {
+                            path: path.clone(),
+                            size_bytes,
+                            error: None,
+                        });
+                        // Queue the actual image as a follow-up user message
+                        // (tool messages are text-only on the OpenAI wire).
+                        // The text prefix gives the model a hint about what
+                        // it's looking at without inflating tokens.
+                        self.pending_user_followups.push(AiMessage {
+                            role: AiRole::User,
+                            content: vec![
+                                AiContent::Text {
+                                    text: format!("[inspect_image result for `{path}`]"),
+                                },
+                                AiContent::Image { media_type, data },
+                            ],
+                        });
+                        Ok((
+                            format!(
+                                "image attached for next turn ({size_bytes} bytes); \
+                                 inspect the image content above before responding"
+                            ),
+                            false,
+                        ))
+                    }
+                    Err(e) => {
+                        sink.emit(Event::InspectImage {
+                            path: path.clone(),
+                            size_bytes: 0,
+                            error: Some(e.clone()),
+                        });
+                        Ok((format!("inspect_image failed: {e}"), true))
+                    }
+                }
+            }
             other => Ok((
                 format!(
-                    "Unknown tool: `{other}`. Available tools: bash, web_search, fetch_url."
+                    "Unknown tool: `{other}`. Available tools: bash, web_search, \
+                     fetch_url, inspect_image."
                 ),
                 true,
             )),
         }
+    }
+
+    /// Resolve `path` against the agent's workspace cwd (same policy as
+    /// the host `bash` tool — relative paths are workspace-rooted), read
+    /// the file, detect a MIME type from the extension, and return the
+    /// base64-encoded body along with the detected media type and raw
+    /// byte length. Refuses files larger than `MAX_INSPECT_BYTES` so a
+    /// stray 100 MB asset can't bloat the context window.
+    fn read_image_for_inspection(
+        &self,
+        path: &str,
+    ) -> Result<(String, String, u64), String> {
+        use base64::Engine;
+
+        const MAX_INSPECT_BYTES: u64 = 10 * 1024 * 1024;
+
+        let raw = std::path::Path::new(path);
+        let absolute = if raw.is_absolute() {
+            raw.to_path_buf()
+        } else {
+            self.executor.cwd().join(raw)
+        };
+        let canonical = std::fs::canonicalize(&absolute)
+            .map_err(|e| format!("cannot resolve `{path}`: {e}"))?;
+        let meta = std::fs::metadata(&canonical)
+            .map_err(|e| format!("cannot stat `{}`: {e}", canonical.display()))?;
+        if !meta.is_file() {
+            return Err(format!("not a regular file: {}", canonical.display()));
+        }
+        if meta.len() > MAX_INSPECT_BYTES {
+            return Err(format!(
+                "file too large: {} bytes (limit {} bytes)",
+                meta.len(),
+                MAX_INSPECT_BYTES
+            ));
+        }
+        let media_type = match canonical
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("png") => "image/png",
+            Some("jpg") | Some("jpeg") => "image/jpeg",
+            Some("webp") => "image/webp",
+            Some("gif") => "image/gif",
+            other => {
+                return Err(format!(
+                    "unsupported image type `{:?}` (expected png/jpg/jpeg/webp/gif)",
+                    other
+                ))
+            }
+        };
+        let bytes = std::fs::read(&canonical)
+            .map_err(|e| format!("cannot read `{}`: {e}", canonical.display()))?;
+        let size_bytes = bytes.len() as u64;
+        let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        Ok((media_type.to_string(), data, size_bytes))
     }
 }
 
@@ -758,6 +893,30 @@ fn build_tool_catalog() -> Vec<AiTool> {
                     }
                 },
                 "required": ["url"]
+            }),
+        },
+        AiTool {
+            name: "inspect_image".to_string(),
+            description: "Load an image from disk and attach it to your \
+                          next reasoning turn so you can actually see it. \
+                          Use this AFTER generating an image (via the \
+                          kotonia /images/generations API or any other \
+                          source) to verify framing, lighting, anatomy, \
+                          subject likeness, etc. Without this call you are \
+                          blind to your own output. Supports png / jpg / \
+                          jpeg / webp / gif up to 10 MB. Relative paths \
+                          resolve against the workspace cwd, same as bash."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the image file. Absolute, \
+                                        `./foo.png`, or `foo.png` all work."
+                    }
+                },
+                "required": ["path"]
             }),
         },
     ]

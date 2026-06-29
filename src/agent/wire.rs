@@ -78,6 +78,12 @@ pub enum WireEvent {
         truncated: bool,
         combined: String,
     },
+    InspectImage {
+        path: String,
+        size_bytes: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     Final {
         answer: String,
     },
@@ -108,6 +114,15 @@ impl WireEvent {
                 timed_out: result.timed_out,
                 truncated: result.truncated,
                 combined: result.combined,
+            },
+            Event::InspectImage {
+                path,
+                size_bytes,
+                error,
+            } => Self::InspectImage {
+                path,
+                size_bytes,
+                error,
             },
             Event::Final { answer } => Self::Final { answer },
             Event::Malformed { excerpt } => Self::Malformed { excerpt },
