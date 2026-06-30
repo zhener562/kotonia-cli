@@ -785,6 +785,14 @@ impl EventSink for StdoutSink {
                     println!("{}", result.combined.trim_end());
                 }
             }
+            Event::InspectImage {
+                path,
+                size_bytes,
+                error,
+            } => match error {
+                None => println!("\n[inspect {path} ({size_bytes} bytes)]"),
+                Some(msg) => println!("\n[inspect {path} failed: {msg}]"),
+            },
             Event::Final { answer } => {
                 println!("\n══ final answer ══");
                 // Claude Code path emits an empty `answer` when the text
