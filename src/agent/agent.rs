@@ -19,6 +19,10 @@
 //! REPL mode keeps full context.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use serde::Serialize;
 
 use crate::ai::{AiCallOptions, AiContent, AiMessage, AiRole, AiStopReason, AiTool};
 use crate::execution::host::{ExecutionResult, HostExecutor};
@@ -46,8 +50,10 @@ pub trait ApprovalHandler: Send {
 }
 
 /// Events the agent emits as it runs. The CLI renders these to stdout;
-/// future `/chat/studio` integration can stream them over SSE.
-#[derive(Debug, Clone)]
+/// the `serve` JSON protocol serializes them one-per-line (the `type` tag
+/// is the snake_case variant name, so `IterationStart` → `iteration_start`).
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
     IterationStart { iteration: u32, max: u32 },
     LlmThinking,
@@ -121,6 +127,11 @@ pub struct Agent {
     /// keep their text-only context.
     native_messages: Vec<AiMessage>,
     history: Option<HistoryStore>,
+    /// Coarse cancellation flag. Checked at each iteration boundary so a
+    /// frontend can stop a runaway turn between tool calls (in-flight bash /
+    /// LLM calls still complete first — that's the "coarse" tradeoff). Reset
+    /// to `false` at the start of every `run_turn`.
+    cancel: Arc<AtomicBool>,
 }
 
 impl Agent {
@@ -151,7 +162,15 @@ impl Agent {
             messages,
             native_messages: Vec::new(),
             history: None,
+            cancel: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// A shared handle to the cancellation flag. A frontend (e.g. the `serve`
+    /// stdin reader) sets it to `true` to request that the current turn stop
+    /// at the next iteration boundary.
+    pub fn cancel_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancel)
     }
 
     /// Attach an on-disk session log. Every message pushed into the
@@ -260,9 +279,13 @@ impl Agent {
         sink: &mut dyn EventSink,
     ) -> Result<String, AgentError> {
         self.history_turn_start();
+        self.cancel.store(false, Ordering::SeqCst);
         self.push_logged(ChatMsg::user(task.to_string()));
 
         for iter in 1..=self.config.max_iterations {
+            if let Some(e) = self.check_cancelled(iter, sink) {
+                return Err(e);
+            }
             sink.emit(Event::IterationStart {
                 iteration: iter,
                 max: self.config.max_iterations,
@@ -369,6 +392,23 @@ impl Agent {
         self.messages.push(msg);
     }
 
+    /// If a cancellation was requested, emit a terminal `Done{success:false}`,
+    /// close the history turn, and return the error to bail the loop. `iter`
+    /// is the iteration we were about to start, so completed iterations is
+    /// `iter - 1`. Returns `None` when no cancellation is pending.
+    fn check_cancelled(&mut self, iter: u32, sink: &mut dyn EventSink) -> Option<AgentError> {
+        if !self.cancel.load(Ordering::SeqCst) {
+            return None;
+        }
+        let done = iter.saturating_sub(1);
+        sink.emit(Event::Done {
+            iterations: done,
+            success: false,
+        });
+        self.history_turn_end(done, false);
+        Some(AgentError::Cancelled)
+    }
+
     async fn run_turn_native(
         &mut self,
         task: &str,
@@ -376,6 +416,7 @@ impl Agent {
         sink: &mut dyn EventSink,
     ) -> Result<String, AgentError> {
         self.history_turn_start();
+        self.cancel.store(false, Ordering::SeqCst);
         self.hydrate_native_from_messages();
         self.native_messages
             .push(AiMessage::user_text(task.to_string()));
@@ -388,6 +429,9 @@ impl Agent {
         self.messages.push(user_log);
 
         for iter in 1..=self.config.max_iterations {
+            if let Some(e) = self.check_cancelled(iter, sink) {
+                return Err(e);
+            }
             sink.emit(Event::IterationStart {
                 iteration: iter,
                 max: self.config.max_iterations,
@@ -791,6 +835,10 @@ pub enum AgentError {
     Llm(String),
     Executor(String),
     IterationLimit(u32),
+    /// A frontend requested cancellation and the loop stopped at an
+    /// iteration boundary. A terminal `Done{success:false}` was already
+    /// emitted before this bubbles.
+    Cancelled,
 }
 
 impl std::fmt::Display for AgentError {
@@ -801,6 +849,7 @@ impl std::fmt::Display for AgentError {
             AgentError::IterationLimit(n) => {
                 write!(f, "agent hit iteration cap ({n}) without final answer")
             }
+            AgentError::Cancelled => write!(f, "turn cancelled by operator"),
         }
     }
 }

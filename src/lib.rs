@@ -14,3 +14,4 @@ pub mod execution;
 pub mod login;
 pub mod notifier;
 pub mod providers;
+pub mod serve;

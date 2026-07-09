@@ -35,6 +35,7 @@ use kotonia_cli::config as daemon_config;
 use kotonia_cli::daemon::{self, DaemonConfig};
 use kotonia_cli::login;
 use kotonia_cli::notifier;
+use kotonia_cli::serve;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -219,6 +220,13 @@ struct RunArgs {
     /// supports native tool calling. Useful for diffing/debugging.
     #[arg(long)]
     force_delimiter: bool,
+
+    /// Speak the JSON stdio protocol (JSONL) instead of the human TTY UI.
+    /// For the VS Code extension / machine-readable frontends: stdout carries
+    /// the protocol, stderr stays logs. Only the `react` engine is supported.
+    /// See `src/serve.rs` for the wire contract. Combine with `--resume <id>`.
+    #[arg(long)]
+    serve: bool,
 }
 
 #[tokio::main]
@@ -370,6 +378,41 @@ async fn main() -> ExitCode {
             }
             Err(e) => {
                 eprintln!("kotonia-cli: history disabled ({e})");
+            }
+        }
+    }
+
+    // JSON stdio protocol: skip the human banner/REPL and drive the agent from
+    // stdin. Only the ReAct engine exposes the event/approval surface the
+    // protocol needs; claude-code runs its own tool loop, so reject it here.
+    if cli.serve {
+        match agent {
+            DispatchAgent::ReAct(react_agent) => {
+                let hello = serve::HelloInfo {
+                    model: react_agent.model_id().to_string(),
+                    backend: react_agent.backend_label().to_string(),
+                    tool_mode: if react_agent.native_mode() {
+                        "native"
+                    } else {
+                        "delimiter"
+                    },
+                    approval_mode: approval_mode.to_string(),
+                    workspace_root: workspace.root.to_string_lossy().to_string(),
+                    is_worktree: workspace.is_worktree(),
+                    session_id: react_agent.session_id().map(|s| s.to_string()),
+                    kotonia_api: kotonia_api_enabled,
+                };
+                serve::serve(react_agent, hello).await;
+                cleanup_workspace(workspace, cli.keep_worktree, cli.quiet_shutdown).await;
+                return ExitCode::SUCCESS;
+            }
+            DispatchAgent::ClaudeCode(_) => {
+                eprintln!(
+                    "kotonia-cli: --serve is only supported with the `react` engine \
+                     (not claude-code)"
+                );
+                cleanup_workspace(workspace, cli.keep_worktree, cli.quiet_shutdown).await;
+                return ExitCode::from(2);
             }
         }
     }

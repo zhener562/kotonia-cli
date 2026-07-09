@@ -1,0 +1,102 @@
+{
+  "name": "kotonia-agent",
+  "displayName": "Kotonia Agent",
+  "description": "Drive the kotonia-cli shell agent from VS Code — a thin client over the Rust engine's JSON stdio protocol.",
+  "version": "0.0.1",
+  "publisher": "kotonia",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zhener562/kotonia-cli"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other",
+    "Machine Learning"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "commands": [
+      {
+        "command": "kotonia.start",
+        "title": "Kotonia: Open Agent",
+        "category": "Kotonia"
+      },
+      {
+        "command": "kotonia.newSession",
+        "title": "Kotonia: New Session (restart engine)",
+        "category": "Kotonia"
+      },
+      {
+        "command": "kotonia.cancel",
+        "title": "Kotonia: Cancel Current Turn",
+        "category": "Kotonia"
+      },
+      {
+        "command": "kotonia.setKotoniaApiKey",
+        "title": "Kotonia: Set Kotonia API Key",
+        "category": "Kotonia"
+      },
+      {
+        "command": "kotonia.setDeepSeekApiKey",
+        "title": "Kotonia: Set DeepSeek API Key",
+        "category": "Kotonia"
+      }
+    ],
+    "configuration": {
+      "title": "Kotonia Agent",
+      "properties": {
+        "kotonia.enginePath": {
+          "type": "string",
+          "default": "kotonia-cli",
+          "markdownDescription": "Path to the `kotonia-cli` engine binary. Resolved on the extension host (i.e. the remote/WSL host when connected). Leave as `kotonia-cli` to use PATH, or point at a debug build like `${workspaceFolder}/target/debug/kotonia-cli`."
+        },
+        "kotonia.model": {
+          "type": "string",
+          "default": "kotonia-gemma4-26b",
+          "markdownDescription": "Model id passed to the engine. Hosted (GPU-free, needs `KOTONIA_API_KEY`): `kotonia-gemma4-26b`, `kotonia-v4-flash`. Local: `gemma4-26b-uncensored`, `deepseek-v4-flash`. DeepSeek API: `deepseek-chat`, `deepseek-reasoner`."
+        },
+        "kotonia.approvalMode": {
+          "type": "string",
+          "enum": [
+            "all",
+            "allowlist",
+            "auto"
+          ],
+          "default": "allowlist",
+          "markdownDescription": "`all` gates every command, `allowlist` auto-runs read-only/build/test families and gates destructive ones, `auto` runs everything without asking."
+        },
+        "kotonia.workspaceMode": {
+          "type": "string",
+          "enum": [
+            "worktree",
+            "in-place"
+          ],
+          "default": "worktree",
+          "markdownDescription": "`worktree` (default) runs the agent in an isolated git worktree so your working copy is untouched until you merge. `in-place` edits the workspace directly (edits show live in the editor, but no isolation)."
+        },
+        "kotonia.extraArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Extra CLI arguments appended to the engine spawn (e.g. [\"--max-iterations\", \"50\"])."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "typecheck": "tsc --noEmit -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  }
+}
