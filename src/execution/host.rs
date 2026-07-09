@@ -89,16 +89,29 @@ impl HostExecutor {
     /// so it can use pipes, redirections, and shell built-ins without
     /// worrying about which command runner is in front.
     pub async fn bash(&self, command: &str) -> Result<ExecutionResult, HostExecutorError> {
-        let mut child = Command::new("bash")
-            .arg("-c")
+        let mut cmd = Command::new("bash");
+        cmd.arg("-c")
             .arg(command)
             .current_dir(&self.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
-            .spawn()
-            .map_err(HostExecutorError::Spawn)?;
+            // Non-interactive defaults for the tools that check env vars
+            // before deciding whether to prompt. Without these, `git commit`
+            // (no `-m`) launches `$EDITOR`, `git log`/`diff` launch `less`,
+            // etc. — with the tty detachment below they'd still fail, just
+            // less legibly (a raw ENXIO) than the clear messages these vars
+            // produce ("Aborting commit due to empty commit message", etc).
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_EDITOR", "true")
+            .env("EDITOR", "true")
+            .env("VISUAL", "true")
+            .env("GIT_PAGER", "cat")
+            .env("PAGER", "cat")
+            .env("DEBIAN_FRONTEND", "noninteractive");
+        detach_controlling_terminal(&mut cmd);
+        let mut child = cmd.spawn().map_err(HostExecutorError::Spawn)?;
 
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
@@ -169,6 +182,47 @@ impl HostExecutor {
         })
     }
 }
+
+/// Detach the spawned child into its own session with no controlling
+/// terminal. Interactive programs (`sudo`, `ssh`, `vim`/`nano`, `less`/
+/// `more`, `passwd`, ...) don't read prompts from stdin — they open
+/// `/dev/tty` directly, which resolves via the *session's* controlling
+/// terminal, independent of whatever stdin/stdout are redirected to. Left
+/// alone, the child inherits kotonia-cli's own controlling terminal (if any)
+/// and that open+read genuinely blocks, for up to `self.timeout`, since
+/// nothing is ever going to type into it.
+///
+/// `setsid()` makes the child a new session leader with no controlling
+/// terminal at all, so that same `open("/dev/tty")` fails immediately with
+/// `ENXIO` instead of blocking — the same technique `nohup`/daemonization
+/// tooling uses. This is a structural fix (no command-name pattern
+/// matching): every tty-seeking program fails fast, not just ones we
+/// happened to enumerate.
+#[cfg(unix)]
+fn detach_controlling_terminal(cmd: &mut Command) {
+    // SAFETY: the closure only calls the async-signal-safe libc::setsid()
+    // between fork and exec, per `pre_exec`'s contract — no allocation, no
+    // locking, nothing else.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                let err = std::io::Error::last_os_error();
+                // EPERM means the child is already a process group leader
+                // (so it can't start a *new* session) — it still has no
+                // controlling terminal assigned as a result, which is the
+                // property we actually want, so treat this as success
+                // rather than failing the spawn.
+                if err.raw_os_error() != Some(libc::EPERM) {
+                    return Err(err);
+                }
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn detach_controlling_terminal(_cmd: &mut Command) {}
 
 fn push_lossy_line(combined: &mut String, raw: &[u8], truncated: &mut bool) {
     // Trim the trailing '\n' (kept by read_until) so append_capped only
@@ -251,5 +305,46 @@ mod tests {
         // No assertion on the exact replacement string — just that it
         // doesn't fail and produces *some* output.
         assert!(!r.combined.is_empty(), "lossy decode produced empty output");
+    }
+
+    #[tokio::test]
+    async fn tty_open_fails_fast_instead_of_hanging() {
+        // Without the setsid detachment, this would inherit whatever
+        // controlling terminal the test runner has (if any) and block
+        // opening /dev/tty waiting for input nobody will supply. With
+        // detachment, the child has no controlling terminal at all, so the
+        // open fails immediately (ENXIO) and bash's `exec` redirection
+        // fails right away instead of hanging for the executor timeout.
+        let exec = HostExecutor::new(std::env::temp_dir()).with_timeout(Duration::from_secs(5));
+        let r = exec.bash("exec 3< /dev/tty").await.unwrap();
+        assert!(
+            !r.timed_out,
+            "opening /dev/tty blocked instead of failing fast"
+        );
+        assert_ne!(r.exit_code, 0);
+    }
+
+    #[tokio::test]
+    async fn git_commit_without_message_fails_fast() {
+        // `git commit` with no `-m` normally launches `$EDITOR` and blocks
+        // waiting for a human to write a commit message. `GIT_EDITOR=true`
+        // makes that a no-op, so git sees an unmodified (comments-only)
+        // message and aborts immediately instead of hanging.
+        let dir = tempfile::tempdir().unwrap();
+        let exec = HostExecutor::new(dir.path()).with_timeout(Duration::from_secs(10));
+        let setup = exec
+            .bash(
+                "git init -q && git config user.email a@b.c && \
+                 git config user.name t && echo hi > f.txt && git add f.txt",
+            )
+            .await
+            .unwrap();
+        assert_eq!(setup.exit_code, 0, "setup failed: {}", setup.combined);
+
+        let r = exec.bash("git commit").await.unwrap();
+        assert!(
+            !r.timed_out,
+            "git commit without -m hung waiting for an editor"
+        );
     }
 }
