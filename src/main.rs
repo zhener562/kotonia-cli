@@ -223,6 +223,26 @@ struct RunArgs {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Propagate the paired device_token into KOTONIA_API_KEY so (a) the
+    // one-shot/REPL run path's `kotonia_api_base` gate below (which only
+    // checks the env var) actually fires for a plain `kotonia-cli login`
+    // session, and (b) the ReAct agent's bash subprocess inherits a
+    // working key for the curl examples in its system prompt
+    // (`Authorization: Bearer $KOTONIA_API_KEY`). Without this, a logged-in
+    // user who never separately exported KOTONIA_API_KEY gets a working
+    // chat model (the LLM call itself falls back to the device_token) but
+    // an agent that has no idea the images/audio/video API exists at all —
+    // it just hallucinates a made-up local endpoint instead. Mirrors
+    // kotonia-desktop's `main.rs`, which does the same bridge.
+    if let Some(cfg) = daemon_config::load() {
+        if std::env::var_os("KOTONIA_API_KEY").is_none() {
+            std::env::set_var("KOTONIA_API_KEY", &cfg.device_token);
+        }
+        if std::env::var_os("KOTONIA_API_BASE").is_none() {
+            std::env::set_var("KOTONIA_API_BASE", &cfg.server);
+        }
+    }
+
     let cli = Cli::parse();
 
     match cli.cmd {
