@@ -96,8 +96,8 @@ enum LogEntry {
 impl HistoryStore {
     /// Default session directory (`~/.kotonia/sessions/`).
     pub fn default_dir() -> Result<PathBuf, HistoryError> {
-        let home = std::env::var_os("HOME").ok_or(HistoryError::NoHome)?;
-        let p = PathBuf::from(home).join(".kotonia").join("sessions");
+        let home = dirs::home_dir().ok_or(HistoryError::NoHome)?;
+        let p = home.join(".kotonia").join("sessions");
         std::fs::create_dir_all(&p)?;
         Ok(p)
     }
