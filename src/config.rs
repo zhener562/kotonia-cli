@@ -19,10 +19,9 @@ pub struct DaemonStoredConfig {
     pub device_token: String,
 }
 
-/// Returns `$HOME/.kotonia/daemon.json`, or None if $HOME is unset.
+/// Returns `<home>/.kotonia/daemon.json`, or None if the home dir can't be resolved.
 pub fn config_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".kotonia").join("daemon.json"))
+    Some(dirs::home_dir()?.join(".kotonia").join("daemon.json"))
 }
 
 pub fn load() -> Option<DaemonStoredConfig> {
@@ -54,10 +53,9 @@ pub fn save(cfg: &DaemonStoredConfig) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// Returns `$HOME/.kotonia/providers.json`, or None if $HOME is unset.
+/// Returns `<home>/.kotonia/providers.json`, or None if the home dir can't be resolved.
 pub fn providers_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".kotonia").join("providers.json"))
+    Some(dirs::home_dir()?.join(".kotonia").join("providers.json"))
 }
 
 /// One entry in `providers.json`. Every field is optional so the file can
