@@ -20,7 +20,7 @@
 
 use std::path::Path;
 
-use crate::ai::{AiCallOptions, AiContent, AiMessage, AiRole, AiStopReason, AiTool};
+use crate::ai::{AiCallOptions, AiContent, AiMessage, AiRole, AiStopReason, AiTool, AiToolChoice};
 use crate::execution::host::{ExecutionResult, HostExecutor};
 
 use super::approval::{decide, ApprovalMode, Decision};
@@ -140,6 +140,11 @@ pub struct Agent {
     /// here; the agent loop drains the queue right after the tool-role
     /// message is appended, so the assistant's next turn sees both.
     pending_user_followups: Vec<AiMessage>,
+    /// Native mode sends `tool_choice: "required"` so the model can never
+    /// emit free-form prose instead of an action (`final_answer` is a tool,
+    /// so finishing is still expressible). Backends that reject `required`
+    /// flip this off for the rest of the session and fall back to `auto`.
+    tool_choice_required: bool,
     history: Option<HistoryStore>,
 }
 
@@ -171,6 +176,7 @@ impl Agent {
             messages,
             native_messages: Vec::new(),
             pending_user_followups: Vec::new(),
+            tool_choice_required: native_mode,
             history: None,
         }
     }
@@ -415,18 +421,7 @@ impl Agent {
             });
             sink.emit(Event::LlmThinking);
 
-            let options = AiCallOptions::new(
-                self.provider.model_id().to_string(),
-                self.config.max_tokens,
-            )
-            .with_system(self.system_prompt.clone())
-            .with_tools(self.tool_catalog.clone());
-
-            let response = match self
-                .provider
-                .complete_with_tools(self.native_messages.clone(), options)
-                .await
-            {
+            let response = match self.complete_native().await {
                 Ok(r) => r,
                 Err(e) => {
                     let msg = e.to_string();
@@ -455,10 +450,73 @@ impl Agent {
                 .map(|(id, name, input)| (id.to_string(), name.to_string(), input.clone()))
                 .collect();
 
+            // `final_answer` ends the turn. It takes precedence over any
+            // sibling tool calls in the same response (the model declared
+            // itself done). Synthetic tool results are appended for every
+            // call so the wire history stays valid for follow-up turns —
+            // OpenAI-strict backends reject an assistant tool_call that has
+            // no matching tool message.
+            if let Some((final_id, final_input)) = tool_uses
+                .iter()
+                .find(|(_, name, _)| name == "final_answer")
+                .map(|(id, _, input)| (id.clone(), input.clone()))
+            {
+                match final_answer_text(&final_input, &response.text()) {
+                    Some(answer) => {
+                        let mut blocks: Vec<AiContent> = Vec::new();
+                        for (id, name, _) in &tool_uses {
+                            let content = if *id == final_id {
+                                "answer delivered to operator".to_string()
+                            } else {
+                                format!("skipped `{name}`: final_answer ended the task")
+                            };
+                            blocks.push(AiContent::ToolResult {
+                                tool_use_id: id.clone(),
+                                content,
+                                is_error: false,
+                            });
+                        }
+                        self.native_messages.push(AiMessage {
+                            role: AiRole::Tool,
+                            content: blocks,
+                        });
+                        sink.emit(Event::Final {
+                            answer: answer.clone(),
+                        });
+                        sink.emit(Event::Done {
+                            iterations: iter,
+                            success: true,
+                        });
+                        self.history_turn_end(iter, true);
+                        return Ok(answer);
+                    }
+                    None => {
+                        // Empty answer — bounce it back instead of ending
+                        // the turn with nothing to show the operator.
+                        let blocks: Vec<AiContent> = tool_uses
+                            .iter()
+                            .map(|(id, _, _)| AiContent::ToolResult {
+                                tool_use_id: id.clone(),
+                                content: "final_answer called with empty `answer` — \
+                                          call it again with the actual answer text"
+                                    .to_string(),
+                                is_error: true,
+                            })
+                            .collect();
+                        self.native_messages.push(AiMessage {
+                            role: AiRole::Tool,
+                            content: blocks,
+                        });
+                        continue;
+                    }
+                }
+            }
+
             if tool_uses.is_empty() {
-                // No tool calls — this is the final answer. Accept any
-                // stop reason here: MaxTokens still gets the text we
-                // have, EndTurn is the happy path.
+                // No tool calls despite `tool_choice: required` — either the
+                // backend ignores the parameter or we already demoted to
+                // `auto`. Treat the text as the final answer (graceful
+                // degradation, same contract as before `final_answer`).
                 let answer = response.text();
                 if let AiStopReason::MaxTokens = response.stop_reason {
                     sink.emit(Event::Error {
@@ -530,6 +588,44 @@ impl Agent {
         });
         self.history_turn_end(self.config.max_iterations, false);
         Err(AgentError::IterationLimit(self.config.max_iterations))
+    }
+
+    /// One LLM call on the native path. Sends `tool_choice: "required"`
+    /// (an action every turn — `final_answer` is how the model finishes);
+    /// if the backend rejects the parameter, demote to `auto` for the rest
+    /// of the session and retry once.
+    async fn complete_native(
+        &mut self,
+    ) -> Result<crate::ai::AiResponse, super::provider::ProviderError> {
+        let build_options = |required: bool, this: &Self| {
+            AiCallOptions::new(this.provider.model_id().to_string(), this.config.max_tokens)
+                .with_system(this.system_prompt.clone())
+                .with_tools(this.tool_catalog.clone())
+                .with_tool_choice(if required {
+                    AiToolChoice::Any
+                } else {
+                    AiToolChoice::Auto
+                })
+        };
+        let options = build_options(self.tool_choice_required, self);
+        let result = self
+            .provider
+            .complete_with_tools(self.native_messages.clone(), options)
+            .await;
+        match result {
+            Err(e) if self.tool_choice_required && rejects_required_tool_choice(&e) => {
+                eprintln!(
+                    "kotonia-cli: backend rejected tool_choice=required — \
+                     falling back to auto for this session ({e})"
+                );
+                self.tool_choice_required = false;
+                let options = build_options(false, self);
+                self.provider
+                    .complete_with_tools(self.native_messages.clone(), options)
+                    .await
+            }
+            other => other,
+        }
     }
 
     /// On the first native turn (or first turn after a `--resume`), seed
@@ -750,7 +846,7 @@ impl Agent {
             other => Ok((
                 format!(
                     "Unknown tool: `{other}`. Available tools: bash, web_search, \
-                     fetch_url, inspect_image."
+                     fetch_url, inspect_image, final_answer."
                 ),
                 true,
             )),
@@ -823,6 +919,40 @@ fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Extract the answer text from a `final_answer` tool call. Falls back to
+/// the assistant's prose content when the `answer` argument is missing or
+/// blank (some models put the text in content and call the tool with `{}`).
+/// Returns `None` when both are empty — the loop bounces an error back.
+fn final_answer_text(input: &serde_json::Value, prose_fallback: &str) -> Option<String> {
+    let arg = input
+        .get("answer")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match arg {
+        Some(a) => Some(a.to_string()),
+        None => {
+            let fallback = prose_fallback.trim();
+            if fallback.is_empty() {
+                None
+            } else {
+                Some(fallback.to_string())
+            }
+        }
+    }
+}
+
+/// Detect an API rejection of `tool_choice: "required"`. vLLM and some
+/// OpenAI-compatible proxies return HTTP 400 with a message naming the
+/// parameter; anything mentioning it on an API-level error is close enough
+/// to warrant the one-time demotion to `auto`.
+fn rejects_required_tool_choice(err: &super::provider::ProviderError) -> bool {
+    let super::provider::ProviderError::Api(msg) = err else {
+        return false;
+    };
+    msg.to_ascii_lowercase().contains("tool_choice")
+}
+
 /// Tool catalog advertised over the OpenAI-compatible `tools` array.
 /// Keep the schema inside the OpenAPI 3.0 subset shared by every backend
 /// (no `$ref`, no `oneOf`/`anyOf`, no `additionalProperties`).
@@ -893,6 +1023,27 @@ fn build_tool_catalog() -> Vec<AiTool> {
                     }
                 },
                 "required": ["url"]
+            }),
+        },
+        AiTool {
+            name: "final_answer".to_string(),
+            description: "Finish the task and deliver your answer to the \
+                          operator. Call this exactly once, when you have \
+                          enough information — `answer` is shown to the \
+                          operator verbatim and the loop ends. This is the \
+                          ONLY way to finish; plain-text replies are not \
+                          accepted."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "answer": {
+                        "type": "string",
+                        "description": "Concise summary of what you did and \
+                                        the answer for the operator."
+                    }
+                },
+                "required": ["answer"]
             }),
         },
         AiTool {
@@ -971,3 +1122,60 @@ impl std::fmt::Display for AgentError {
 }
 
 impl std::error::Error for AgentError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn final_answer_prefers_answer_argument() {
+        let input = json!({"answer": "  42  "});
+        assert_eq!(
+            final_answer_text(&input, "prose"),
+            Some("42".to_string())
+        );
+    }
+
+    #[test]
+    fn final_answer_falls_back_to_prose_when_arg_missing_or_blank() {
+        assert_eq!(
+            final_answer_text(&json!({}), "the prose answer"),
+            Some("the prose answer".to_string())
+        );
+        assert_eq!(
+            final_answer_text(&json!({"answer": "   "}), "prose"),
+            Some("prose".to_string())
+        );
+    }
+
+    #[test]
+    fn final_answer_empty_everywhere_is_none() {
+        assert_eq!(final_answer_text(&json!({}), "   "), None);
+        assert_eq!(final_answer_text(&json!({"answer": ""}), ""), None);
+    }
+
+    #[test]
+    fn tool_catalog_includes_final_answer() {
+        let catalog = build_tool_catalog();
+        let final_tool = catalog
+            .iter()
+            .find(|t| t.name == "final_answer")
+            .expect("final_answer must be in the native tool catalog");
+        assert_eq!(final_tool.input_schema["required"][0], "answer");
+    }
+
+    #[test]
+    fn detects_tool_choice_rejection() {
+        use super::super::provider::ProviderError;
+        assert!(rejects_required_tool_choice(&ProviderError::Api(
+            "API error (400): \"tool_choice\" value \"required\" is not supported".into()
+        )));
+        assert!(!rejects_required_tool_choice(&ProviderError::Api(
+            "API error (429): rate limited".into()
+        )));
+        assert!(!rejects_required_tool_choice(&ProviderError::Transport(
+            "connection refused while sending tool_choice".into()
+        )));
+    }
+}
