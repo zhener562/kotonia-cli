@@ -32,6 +32,13 @@ pub enum ProviderHook {
     /// `reasoning_effort` accordingly. `deepseek-reasoner` defaults to
     /// thinking; `deepseek-chat` defaults to non-thinking.
     DeepSeekThinking,
+    /// Kotonia-hosted models. `kotonia-thinkcap-27b` gets the base model's
+    /// official sampling (temp 1.0 / top_p 0.95 / top_k 20) and a
+    /// `max_tokens` floor of 8192 — the model card requires ≥4096
+    /// (preferably 8192+) or the reasoning budget truncates to blank
+    /// output. The `:nothink` suffix disables thinking via
+    /// `chat_template_kwargs` for latency-sensitive callers.
+    Kotonia,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +68,26 @@ impl ProviderSpec {
         let mut extra_body = self.extra_body_base.clone();
         let canonical = match self.hook {
             ProviderHook::None => requested_model.to_string(),
+            ProviderHook::Kotonia => {
+                let (canon, thinking) = match requested_model.strip_suffix(":nothink") {
+                    Some(stripped) => (stripped.to_string(), false),
+                    None => (requested_model.to_string(), true),
+                };
+                if canon == "kotonia-thinkcap-27b" {
+                    extra_body.insert("temperature".into(), json!(1.0));
+                    extra_body.insert("top_p".into(), json!(0.95));
+                    extra_body.insert("top_k".into(), json!(20));
+                    if thinking {
+                        extra_body.insert("max_tokens".into(), json!(8192));
+                    } else {
+                        extra_body.insert(
+                            "chat_template_kwargs".into(),
+                            json!({"enable_thinking": false}),
+                        );
+                    }
+                }
+                canon
+            }
             ProviderHook::DeepSeekThinking => {
                 let (canon, thinking_enabled) =
                     match requested_model.strip_suffix(":thinking") {
@@ -105,7 +132,11 @@ impl ProviderRegistry {
 
         // ── Built-in: kotonia (hosted /api/v1) ─────────────────────────────
         let kotonia = kotonia_builtin();
-        for m in ["kotonia-gemma4-26b"] {
+        for m in [
+            "kotonia-gemma4-26b",
+            "kotonia-thinkcap-27b",
+            "kotonia-thinkcap-27b:nothink",
+        ] {
             model_index.insert(m.into(), kotonia.name.clone());
         }
         specs.insert(kotonia.name.clone(), kotonia);
@@ -207,7 +238,7 @@ fn kotonia_builtin() -> ProviderSpec {
         max_tokens_cap: None,
         extra_headers: Vec::new(),
         extra_body_base: Map::new(),
-        hook: ProviderHook::None,
+        hook: ProviderHook::Kotonia,
     }
 }
 
@@ -314,6 +345,41 @@ mod tests {
         let r = spec.resolve_request("kotonia-gemma4-26b");
         assert_eq!(r.canonical_model, "kotonia-gemma4-26b");
         assert!(r.extra_body.is_empty());
+    }
+
+    #[test]
+    fn thinkcap_gets_official_sampling_and_token_floor() {
+        let spec = kotonia_builtin();
+        let r = spec.resolve_request("kotonia-thinkcap-27b");
+        assert_eq!(r.canonical_model, "kotonia-thinkcap-27b");
+        assert_eq!(r.extra_body["temperature"], json!(1.0));
+        assert_eq!(r.extra_body["top_p"], json!(0.95));
+        assert_eq!(r.extra_body["top_k"], json!(20));
+        // Thinking mode: model card requires >=4096 (preferably 8192+) or
+        // the reasoning budget truncates to blank output.
+        assert_eq!(r.extra_body["max_tokens"], json!(8192));
+        assert!(!r.extra_body.contains_key("chat_template_kwargs"));
+    }
+
+    #[test]
+    fn thinkcap_nothink_suffix_disables_thinking() {
+        let spec = kotonia_builtin();
+        let r = spec.resolve_request("kotonia-thinkcap-27b:nothink");
+        assert_eq!(r.canonical_model, "kotonia-thinkcap-27b");
+        assert_eq!(
+            r.extra_body["chat_template_kwargs"],
+            json!({"enable_thinking": false})
+        );
+        assert!(!r.extra_body.contains_key("max_tokens"));
+    }
+
+    #[test]
+    fn thinkcap_models_route_to_kotonia_provider() {
+        let reg = ProviderRegistry::load().unwrap();
+        for m in ["kotonia-thinkcap-27b", "kotonia-thinkcap-27b:nothink"] {
+            let (spec, _) = reg.resolve(None, m).unwrap();
+            assert_eq!(spec.name, "kotonia");
+        }
     }
 
     #[test]
