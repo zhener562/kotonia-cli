@@ -4,6 +4,11 @@
 //! it from a logged-in browser tab, then persists the issued
 //! device_id / device_token to ~/.kotonia/daemon.json so subsequent
 //! `kotonia-cli daemon` invocations need no flags.
+//!
+//! `create_device_code` / `poll_once` are exposed publicly (not just used by
+//! `run`'s CLI loop below) so kotonia-desktop can drive the same flow from
+//! its own GUI — one poll call per tick, driven by the frontend's timer,
+//! instead of a blocking `sleep` loop.
 
 use std::time::Duration;
 
@@ -12,18 +17,18 @@ use tokio::time::sleep;
 
 use crate::config::{save as save_config, DaemonStoredConfig};
 
-#[derive(Debug, Deserialize)]
-struct CreateDeviceCodeResponse {
-    device_code: String,
-    user_code: String,
-    verification_uri: String,
-    expires_in: i64,
-    interval: u32,
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeviceCodeSession {
+    pub device_code: String,
+    pub user_code: String,
+    pub verification_uri: String,
+    pub expires_in: i64,
+    pub interval: u32,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
-enum PollResponse {
+pub enum PollOutcome {
     Pending,
     Approved {
         device_id: String,
@@ -34,16 +39,19 @@ enum PollResponse {
 #[derive(Debug, Serialize)]
 struct EmptyBody {}
 
-pub async fn run(server: &str) -> Result<(), String> {
-    let server = server.trim_end_matches('/');
-    let http = reqwest::Client::builder()
+fn http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
-        .map_err(|e| format!("http client: {e}"))?;
+        .map_err(|e| format!("http client: {e}"))
+}
 
-    let create_url = format!("{server}/api/agent-runtime/device-codes");
+/// POST /api/agent-runtime/device-codes — start a new pairing session.
+pub async fn create_device_code(server: &str) -> Result<DeviceCodeSession, String> {
+    let server = server.trim_end_matches('/');
+    let http = http_client()?;
     let resp = http
-        .post(&create_url)
+        .post(format!("{server}/api/agent-runtime/device-codes"))
         .json(&EmptyBody {})
         .send()
         .await
@@ -53,10 +61,47 @@ pub async fn run(server: &str) -> Result<(), String> {
         let body = resp.text().await.unwrap_or_default();
         return Err(format!("POST device-codes returned {status}: {body}"));
     }
-    let code: CreateDeviceCodeResponse = resp
-        .json()
+    resp.json()
         .await
-        .map_err(|e| format!("parse device-code response: {e}"))?;
+        .map_err(|e| format!("parse device-code response: {e}"))
+}
+
+/// GET /api/agent-runtime/device-codes/{device_code} — one poll attempt.
+/// A `410 Gone` (expired or already consumed) is reported as an `Err`,
+/// same as any other non-success status — there's no `Expired` variant to
+/// match on separately.
+pub async fn poll_once(server: &str, device_code: &str) -> Result<PollOutcome, String> {
+    let server = server.trim_end_matches('/');
+    let http = http_client()?;
+    let resp = http
+        .get(format!("{server}/api/agent-runtime/device-codes/{device_code}"))
+        .send()
+        .await
+        .map_err(|e| format!("poll: {e}"))?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::GONE {
+        return Err("device code expired or already consumed".to_string());
+    }
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("poll returned {status}: {body}"));
+    }
+    resp.json()
+        .await
+        .map_err(|e| format!("parse poll response: {e}"))
+}
+
+/// Persist an approved device pairing to `~/.kotonia/daemon.json`.
+pub fn save_pairing(server: &str, device_id: String, device_token: String) -> Result<std::path::PathBuf, String> {
+    save_config(&DaemonStoredConfig {
+        server: server.trim_end_matches('/').to_string(),
+        device_id,
+        device_token,
+    })
+}
+
+pub async fn run(server: &str) -> Result<(), String> {
+    let code = create_device_code(server).await?;
 
     println!();
     println!("─────────────────────────────────────────────");
@@ -72,7 +117,6 @@ pub async fn run(server: &str) -> Result<(), String> {
     println!("─────────────────────────────────────────────");
     println!();
 
-    let poll_url = format!("{server}/api/agent-runtime/device-codes/{}", code.device_code);
     let interval = Duration::from_secs(code.interval.max(1) as u64);
 
     print!("Waiting for approval");
@@ -84,36 +128,14 @@ pub async fn run(server: &str) -> Result<(), String> {
         print!(".");
         let _ = std::io::stdout().flush();
 
-        let resp = http
-            .get(&poll_url)
-            .send()
-            .await
-            .map_err(|e| format!("\npoll: {e}"))?;
-        let status = resp.status();
-        if status == reqwest::StatusCode::GONE {
-            return Err("\ndevice code expired or already consumed".to_string());
-        }
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!("\npoll returned {status}: {body}"));
-        }
-        let poll: PollResponse = resp
-            .json()
-            .await
-            .map_err(|e| format!("\nparse poll response: {e}"))?;
-        match poll {
-            PollResponse::Pending => continue,
-            PollResponse::Approved {
+        match poll_once(server, &code.device_code).await {
+            Ok(PollOutcome::Pending) => continue,
+            Ok(PollOutcome::Approved {
                 device_id,
                 device_token,
-            } => {
+            }) => {
                 println!(" approved!");
-                let cfg = DaemonStoredConfig {
-                    server: server.to_string(),
-                    device_id: device_id.clone(),
-                    device_token,
-                };
-                let path = save_config(&cfg)?;
+                let path = save_pairing(server, device_id.clone(), device_token)?;
                 println!();
                 println!("Paired as device {}.", &device_id[..8.min(device_id.len())]);
                 println!("Saved to {}", path.display());
@@ -121,6 +143,7 @@ pub async fn run(server: &str) -> Result<(), String> {
                 println!("Run `kotonia-cli daemon` to connect.");
                 return Ok(());
             }
+            Err(e) => return Err(format!("\n{e}")),
         }
     }
 }
