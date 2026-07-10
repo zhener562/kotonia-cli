@@ -77,8 +77,15 @@ impl ProviderSpec {
                     extra_body.insert("temperature".into(), json!(1.0));
                     extra_body.insert("top_p".into(), json!(0.95));
                     extra_body.insert("top_k".into(), json!(20));
+                    // The server's chat template defaults to NO-think so
+                    // legacy voice callers stay fast — thinking is opt-in
+                    // and must be requested explicitly here.
                     if thinking {
                         extra_body.insert("max_tokens".into(), json!(8192));
+                        extra_body.insert(
+                            "chat_template_kwargs".into(),
+                            json!({"enable_thinking": true}),
+                        );
                     } else {
                         extra_body.insert(
                             "chat_template_kwargs".into(),
@@ -233,7 +240,7 @@ fn kotonia_builtin() -> ProviderSpec {
         name: "kotonia".into(),
         base_url,
         api_key,
-        default_model: "kotonia-gemma4-26b".into(),
+        default_model: "kotonia-thinkcap-27b".into(),
         max_tokens_param: MaxTokensParam::MaxTokens,
         max_tokens_cap: None,
         extra_headers: Vec::new(),
@@ -356,9 +363,14 @@ mod tests {
         assert_eq!(r.extra_body["top_p"], json!(0.95));
         assert_eq!(r.extra_body["top_k"], json!(20));
         // Thinking mode: model card requires >=4096 (preferably 8192+) or
-        // the reasoning budget truncates to blank output.
+        // the reasoning budget truncates to blank output. The server
+        // template defaults to no-think, so thinking is requested
+        // explicitly.
         assert_eq!(r.extra_body["max_tokens"], json!(8192));
-        assert!(!r.extra_body.contains_key("chat_template_kwargs"));
+        assert_eq!(
+            r.extra_body["chat_template_kwargs"],
+            json!({"enable_thinking": true})
+        );
     }
 
     #[test]
