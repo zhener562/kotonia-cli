@@ -59,6 +59,12 @@ pub enum WireEvent {
         max: u32,
     },
     LlmThinking,
+    /// Streaming prose chunk from the model (Claude Code engine today).
+    /// Renderers should append, not replace; `Final` will NOT replay the
+    /// same content when it's already been streamed via `Text`.
+    Text {
+        text: String,
+    },
     Bash {
         command: String,
     },
@@ -71,6 +77,12 @@ pub enum WireEvent {
         timed_out: bool,
         truncated: bool,
         combined: String,
+    },
+    InspectImage {
+        path: String,
+        size_bytes: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
     },
     Final {
         answer: String,
@@ -94,6 +106,7 @@ impl WireEvent {
         match event {
             Event::IterationStart { iteration, max } => Self::IterationStart { iteration, max },
             Event::LlmThinking => Self::LlmThinking,
+            Event::Text { text } => Self::Text { text },
             Event::Bash { command } => Self::Bash { command },
             Event::BashSkipped { command, reason } => Self::BashSkipped { command, reason },
             Event::Observation { result } => Self::Observation {
@@ -101,6 +114,15 @@ impl WireEvent {
                 timed_out: result.timed_out,
                 truncated: result.truncated,
                 combined: result.combined,
+            },
+            Event::InspectImage {
+                path,
+                size_bytes,
+                error,
+            } => Self::InspectImage {
+                path,
+                size_bytes,
+                error,
             },
             Event::Final { answer } => Self::Final { answer },
             Event::Malformed { excerpt } => Self::Malformed { excerpt },

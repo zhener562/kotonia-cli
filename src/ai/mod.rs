@@ -31,6 +31,18 @@ pub enum AiContent {
     Text {
         text: String,
     },
+    /// Inline image. Encoded as base64 (no `data:` prefix). On the OpenAI
+    /// wire this turns into an `{"type":"image_url","image_url":{"url":
+    /// "data:<media_type>;base64,<data>"}}` part inside a user message.
+    /// Only carried inside `AiRole::User` messages — multimodal tool
+    /// results land here too (the dispatcher injects an extra user
+    /// message after a `tool` role text acknowledgement).
+    Image {
+        /// e.g. "image/png", "image/jpeg", "image/webp"
+        media_type: String,
+        /// Base64-encoded bytes (no `data:...;base64,` prefix).
+        data: String,
+    },
     /// Assistant requests a tool invocation.
     ToolUse {
         id: String,

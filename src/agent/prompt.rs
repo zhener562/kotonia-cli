@@ -142,7 +142,7 @@ pub fn system_prompt_native(
 Workspace: {workspace}
 {scope_note}
 
-You have three tools:
+You have five tools:
 
 - `bash(command)` — run a single shell command inside the workspace cwd.
   Pipes, redirects, `&&`, `;` are fine. Output is stdout+stderr+exit_code.
@@ -154,12 +154,23 @@ You have three tools:
   when a search snippet isn't enough to answer the question. `max_chars`
   is optional; omit it for the full body, set it (e.g. 8000) for long
   articles to keep the context window manageable.
+- `inspect_image(path)` — load an image from disk and attach it to your
+  next reasoning turn so you can actually SEE it. Without this call you
+  are blind to your own output. After generating an image (e.g. via the
+  kotonia /images/generations API) use this BEFORE claiming success so
+  you can judge framing / lighting / anatomy / likeness yourself instead
+  of guessing. png/jpg/jpeg/webp/gif up to 10 MB.
+- `final_answer(answer)` — finish the task. `answer` is shown to the
+  operator verbatim and the loop ends. This is the ONLY way to finish:
+  every turn must be a tool call, and plain prose without a tool call is
+  rejected by the runtime.
 
 # How to act
 
 - For each user request, decide whether you need information from the
   workspace (bash), from a SERP overview (web_search), from a page's
-  body (fetch_url), or whether you already have enough context to answer.
+  body (fetch_url), or whether you already have enough context to answer
+  via `final_answer`.
 - A typical web flow is: `web_search` first to find candidates, then
   `fetch_url` on the most promising hit. Don't skip `fetch_url` just
   because the snippet looks plausible — the snippet is the first ~240
@@ -169,30 +180,38 @@ You have three tools:
 - For destructive operations (rm, git push, etc.) the operator may have to
   approve the bash call. Be explicit and minimal so they can say yes
   confidently.
-- When you have enough information to answer, stop calling tools and reply
-  with a concise plain-text final answer. The runtime returns that text to
-  the operator verbatim — no markup needed.
+- When you have enough information to answer, call `final_answer` with a
+  concise answer. Never announce an action in prose instead of calling
+  the tool — "I'll check the README" is not an action, `bash` is.
 
 # Examples
 
 User: "What does this repo do?"
 → tool_call bash `cat README.md`
 → (observe the README)
-→ "This is the hage repo — Next.js + Rust voice chat platform with Ditto
-   avatars and Qwen3-TTS. The README walks through dev/prod ports and the
-   build pipeline."
+→ tool_call final_answer `This is the hage repo — Next.js + Rust voice
+   chat platform with Ditto avatars and Qwen3-TTS. The README walks
+   through dev/prod ports and the build pipeline.`
 
 User: "Show me 3 recent posts about Tokio task budgets."
 → tool_call web_search `tokio task budget` 3
 → (observe titles/urls)
-→ "Top 3 recent results: …"
+→ tool_call final_answer `Top 3 recent results: …`
 
 User: "Summarise the axum SSE example."
 → tool_call web_search `axum sse example` 3
 → (observe — pick the official repo URL)
 → tool_call fetch_url `https://github.com/tokio-rs/axum/blob/main/examples/sse/src/main.rs` 8000
 → (observe the actual source)
-→ "The axum SSE example sets up …"
+→ tool_call final_answer `The axum SSE example sets up …`
+
+User: "Generate a portrait of a cute girl."
+→ tool_call bash `curl -sS -X POST ".../api/v1/images/generations" ... > out.png`
+→ (observe — file saved)
+→ tool_call inspect_image `./out.png`
+→ (you SEE the image, then judge quality)
+→ tool_call final_answer `Done — ./out.png. Lighting reads warm, framing
+   centered. If you want sharper detail I can rerun with shift=2.5.`
 "#,
         workspace = workspace.display(),
     );
@@ -233,6 +252,25 @@ OpenAI SDK. Example:
     -H "Content-Type: application/json" \
     -d '{{"prompt":"forest","size":"1024x1024","steps":20}}' \
     | jq -r '.data[0].b64_json' | base64 -d > ./forest.png
+
+## LoRAs on /images/generations (paid plan only)
+
+Stack adapter LoRAs on top of the base HiDream model with `loras`:
+
+  -d '{{"prompt":"...","loras":[{{"name":"kotonia03","weight":1.0}},{{"name":"grok_taste","weight":0.5}}]}}'
+
+Available names (pick by the aesthetic the operator asked for):
+- `kotonia03`     anime + general 美的 booster   (default w=1.0)
+- `grok_taste`    Grok-Imagine-leaning taste     (default w=0.7, no trigger)
+- `kotonia02`     legacy NSFW-leaning style      (default w=1.0)
+- `lora_nipple_v2` anime+photoreal nipple quality (default w=0.75)
+- `lora_nipple_v1` legacy anime nipple boost     (default w=0.5)
+
+If the operator just says "make a good image" with no aesthetic hint,
+the validated baseline is `kotonia03@1.0 + grok_taste@0.5` — use that.
+
+Free-tier accounts get HTTP 403 when any LoRA is set. On 403, retry
+without `loras` and surface that the operator's account is on free tier.
 "#,
         base = base,
     )
@@ -271,6 +309,30 @@ curl -sS -X POST "{base}/api/v1/images/generations" \
   -d '{{"prompt":"a calm forest path at dawn","size":"1024x1024","steps":20}}' \
   | jq -r '.data[0].b64_json' | base64 -d > ./forest.png && ls -l ./forest.png
 {BASH_CLOSE}
+
+### LoRAs (paid plan only)
+
+Stack adapter LoRAs on top of the base HiDream model with `loras`:
+
+{BASH_OPEN}
+curl -sS -X POST "{base}/api/v1/images/generations" \
+  -H "Authorization: Bearer $KOTONIA_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{{"prompt":"...","size":"1024x1024","steps":20,"loras":[{{"name":"kotonia03","weight":1.0}},{{"name":"grok_taste","weight":0.5}}]}}'
+{BASH_CLOSE}
+
+Available LoRA names (pick by the aesthetic the operator asked for):
+- `kotonia03`      anime + general 美的 booster    (default w=1.0)
+- `grok_taste`     Grok-Imagine-leaning taste      (default w=0.7, no trigger)
+- `kotonia02`      legacy NSFW-leaning style       (default w=1.0)
+- `lora_nipple_v2` anime+photoreal nipple quality  (default w=0.75)
+- `lora_nipple_v1` legacy anime nipple boost       (default w=0.5)
+
+If the operator just says "make a good image" with no aesthetic hint,
+the validated baseline is `kotonia03@1.0 + grok_taste@0.5` — use that.
+
+Free-tier accounts get HTTP 403 when any LoRA is set. On 403, retry
+without `loras` and surface that the operator's account is on free tier.
 
 ## Audio example (Japanese TTS)
 

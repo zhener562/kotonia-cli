@@ -779,6 +779,12 @@ impl EventSink for StdoutSink {
                 print!("· thinking ");
                 let _ = io::stdout().flush();
             }
+            Event::Text { text } => {
+                // Streamed prose from Claude Code (between tool calls).
+                // Print on its own line so it doesn't run into the
+                // "· thinking" marker that precedes it.
+                println!("\n{}", text.trim_end());
+            }
             Event::Bash { command } => {
                 println!("\n$ {command}");
             }
@@ -799,9 +805,22 @@ impl EventSink for StdoutSink {
                     println!("{}", result.combined.trim_end());
                 }
             }
+            Event::InspectImage {
+                path,
+                size_bytes,
+                error,
+            } => match error {
+                None => println!("\n[inspect {path} ({size_bytes} bytes)]"),
+                Some(msg) => println!("\n[inspect {path} failed: {msg}]"),
+            },
             Event::Final { answer } => {
                 println!("\n══ final answer ══");
-                println!("{answer}");
+                // Claude Code path emits an empty `answer` when the text
+                // was already streamed via `Text`. Skip the blank line in
+                // that case so the separator stays clean.
+                if !answer.is_empty() {
+                    println!("{answer}");
+                }
             }
             Event::Malformed { excerpt } => {
                 println!("\n[malformed model output — retrying]");

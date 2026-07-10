@@ -198,12 +198,46 @@ fn content_text_only(content: &[AiContent], role: &str) -> Result<String, AiErro
 }
 
 fn user_message_to_wire(content: &[AiContent]) -> Result<Value, AiError> {
-    // kotonia-cli is text-only: every block must be text, no image variants
-    // exist in this crate's AiContent. Multimodal support can be added back
-    // by re-introducing image variants and a parts-array fallback.
+    // Fast path: if every block is text, keep the string-content shape
+    // (smaller wire payload, max provider compatibility).
+    let has_non_text = content
+        .iter()
+        .any(|c| !matches!(c, AiContent::Text { .. }));
+    if !has_non_text {
+        return Ok(json!({
+            "role": "user",
+            "content": content_text_only(content, "user")?,
+        }));
+    }
+
+    // Multimodal: emit the parts-array form. Text and image blocks both
+    // become OpenAI Chat Completions parts. The `image_url` form with a
+    // `data:` URI works for OpenAI, Anthropic via OpenAI compat, vLLM
+    // Gemma 4 multimodal, etc. Unsupported block types (e.g. ToolUse
+    // accidentally inside a user message) are rejected loudly.
+    let mut parts: Vec<Value> = Vec::with_capacity(content.len());
+    for block in content {
+        match block {
+            AiContent::Text { text } => parts.push(json!({
+                "type": "text",
+                "text": text,
+            })),
+            AiContent::Image { media_type, data } => parts.push(json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": format!("data:{media_type};base64,{data}"),
+                },
+            })),
+            _ => {
+                return Err(AiError::Invalid(
+                    "user messages may only contain text or image blocks".into(),
+                ));
+            }
+        }
+    }
     Ok(json!({
         "role": "user",
-        "content": content_text_only(content, "user")?,
+        "content": parts,
     }))
 }
 
