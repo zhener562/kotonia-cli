@@ -77,6 +77,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("kotonia.refreshSessions", () => sessionTree.refresh()),
     vscode.commands.registerCommand("kotonia.login", () => runLogin()),
     vscode.commands.registerCommand("kotonia.toggleAvatar", () => toggleAvatar()),
+    vscode.commands.registerCommand("kotonia.selectAvatar", () => selectAvatar()),
     vscode.commands.registerCommand("kotonia.cancel", () => engineState?.engine.cancel()),
     vscode.commands.registerCommand("kotonia.reviewChanges", () => reviewChanges()),
     vscode.commands.registerCommand("kotonia.applyChanges", () => applyChanges()),
@@ -282,6 +283,84 @@ function toggleAvatar(): void {
     speakAbort?.abort();
     ui.avatarStop();
   }
+}
+
+/** Friendly display name for well-known kotonia avatars. */
+function avatarLabel(id: string): string | undefined {
+  if (/^kotona/i.test(id)) return "ことな (Kotona)";
+  if (/^hinata/i.test(id)) return "ひなた (Hinata)";
+  return undefined;
+}
+
+/** Pick the talking avatar: lists what's registered on the Ditto server
+ * (ことな / ひなた surfaced first) and lets the user pull any avatar by id.
+ * Falls back to manual id entry when the list can't be fetched. */
+async function selectAvatar(): Promise<void> {
+  const cfg = vscode.workspace.getConfiguration("kotonia");
+  const current = cfg.get<string>("avatar.id", "").trim();
+  const auth = readAvatarAuth(cfg);
+
+  let ids: string[] = [];
+  if (auth) {
+    try {
+      const res = await fetch(`${auth.base}/api/voice/ditto/avatars`, {
+        headers: { Authorization: `Bearer ${auth.token}` },
+      });
+      if (res.ok) {
+        const list = (await res.json()) as Array<{ id?: string }>;
+        ids = list.map((a) => a.id ?? "").filter(Boolean);
+      } else if (res.status === 403 || res.status === 401) {
+        vscode.window.showWarningMessage(
+          "Kotonia: アバター一覧の取得に失敗（未サインイン/期限切れ）。ログインするか、カスタムIDを入力してください。",
+        );
+      }
+    } catch {
+      /* offline — fall through to manual entry */
+    }
+  }
+
+  // ことな / ひなた を先頭に、あとは id 昇順。
+  const rank = (x: string) => (/^kotona/i.test(x) ? 0 : /^hinata/i.test(x) ? 1 : 2);
+  ids.sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
+
+  type Item = vscode.QuickPickItem & { avatarId?: string; custom?: boolean };
+  const items: Item[] = ids.map((id) => {
+    const label = avatarLabel(id);
+    return {
+      label: label ?? id,
+      description: label ? id : undefined,
+      detail: id === current ? "現在選択中" : undefined,
+      avatarId: id,
+    };
+  });
+  items.push({ label: "$(edit) カスタムIDを入力…", description: "任意の avatar_id を直接指定", custom: true });
+
+  const picked = await vscode.window.showQuickPick(items, {
+    placeHolder: ids.length
+      ? "アバターを選択（ことな / ひなた / その他 / カスタムID）"
+      : "登録済みアバターを取得できませんでした。カスタムIDを入力してください。",
+  });
+  if (!picked) {
+    return;
+  }
+
+  let id: string | undefined;
+  if (picked.custom) {
+    id = await vscode.window.showInputBox({
+      prompt: "avatar_id を入力（例: kotona_v4 / hinata_v1 / persona_media_123_ditto）",
+      value: current,
+      ignoreFocusOut: true,
+    });
+  } else {
+    id = picked.avatarId;
+  }
+  if (!id || !id.trim()) {
+    return;
+  }
+  await cfg.update("avatar.id", id.trim(), vscode.ConfigurationTarget.Workspace);
+  vscode.window.showInformationMessage(
+    `Kotonia: アバターを「${avatarLabel(id.trim()) ?? id.trim()}」に設定しました（次の発話から反映）。`,
+  );
 }
 
 function readAvatarAuth(cfg: vscode.WorkspaceConfiguration): { base: string; token: string } | undefined {

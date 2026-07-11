@@ -2,7 +2,7 @@
   "name": "kotonia-agent",
   "displayName": "Kotonia Agent",
   "description": "%extension.description%",
-  "version": "0.0.12",
+  "version": "0.0.13",
   "publisher": "kotonia",
   "icon": "media/icon.png",
   "repository": {
@@ -72,6 +72,11 @@
           "group": "1_auth"
         },
         {
+          "command": "kotonia.selectAvatar",
+          "when": "view == kotonia.sessions",
+          "group": "1_auth"
+        },
+        {
           "command": "kotonia.reviewChanges",
           "when": "view == kotonia.sessions",
           "group": "2_worktree"
@@ -114,6 +119,11 @@
       {
         "command": "kotonia.toggleAvatar",
         "title": "%cmd.toggleAvatar.title%",
+        "category": "Kotonia"
+      },
+      {
+        "command": "kotonia.selectAvatar",
+        "title": "%cmd.selectAvatar.title%",
         "category": "Kotonia"
       },
       {
@@ -195,7 +205,7 @@
         "kotonia.avatar.id": {
           "type": "string",
           "default": "kotona_v4",
-          "markdownDescription": "Registered Ditto avatar id. Defaults to the Kotona mascot (`kotona_v4`; `kotona_v1`–`v3` also exist). Register your own via the Kotonia web UI / `/api/voice/ditto/prepare`."
+          "markdownDescription": "Registered Ditto avatar id. Defaults to the Kotona mascot (`kotona_v4`). Use **Kotonia: アバターを選択 / Select Avatar** to pick from the avatars registered on the server (ことな / ひなた / …) or enter any id. `kotona_v1`–`v3`, `hinata_*`, and your own (via `/api/voice/ditto/prepare`) also work."
         },
         "kotonia.avatar.ttsBackend": {
           "type": "string",

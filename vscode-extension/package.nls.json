@@ -7,6 +7,7 @@
   "cmd.openSession.title": "Kotonia: セッションを開く",
   "cmd.login.title": "Kotonia: ログイン（デバイスコード）",
   "cmd.toggleAvatar.title": "Kotonia: 喋るアバターの切り替え",
+  "cmd.selectAvatar.title": "Kotonia: アバターを選択（ことな / ひなた / ID指定）",
   "cmd.cancel.title": "Kotonia: 現在のターンを中止",
   "cmd.reviewChanges.title": "Kotonia: エージェントの変更を確認（worktree 差分）",
   "cmd.applyChanges.title": "Kotonia: 変更をワークスペースに適用",
