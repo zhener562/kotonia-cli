@@ -4,10 +4,11 @@
   "description": "%extension.description%",
   "version": "0.0.15",
   "publisher": "kotonia",
+  "license": "MIT",
   "icon": "media/icon.png",
   "repository": {
     "type": "git",
-    "url": "https://github.com/zhener562/kotonia-cli"
+    "url": "https://github.com/zhener562/kotonia-vscode"
   },
   "engines": {
     "vscode": "^1.85.0"
@@ -158,7 +159,7 @@
         "kotonia.enginePath": {
           "type": "string",
           "default": "kotonia-cli",
-          "markdownDescription": "Path to the `kotonia-cli` engine binary. Resolved on the extension host (i.e. the remote/WSL host when connected). Leave as `kotonia-cli` to use PATH, or point at a debug build like `${workspaceFolder}/target/debug/kotonia-cli`."
+          "markdownDescription": "Path to the `kotonia-cli` engine binary. Resolved on the extension host (i.e. the remote/WSL host when connected). The default uses the bundled helper binary when present, then falls back to PATH. Point at a debug build like `${workspaceFolder}/target/debug/kotonia-cli` to override it."
         },
         "kotonia.model": {
           "type": "string",
@@ -245,9 +246,12 @@
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "typecheck": "tsc --noEmit -p ./"
+    "typecheck": "tsc --noEmit -p ./",
+    "package": "vsce package",
+    "publish:marketplace": "vsce publish"
   },
   "devDependencies": {
+    "@vscode/vsce": "^3.6.0",
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
     "typescript": "^5.4.0"

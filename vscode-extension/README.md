@@ -21,6 +21,22 @@ Protocol wire types live in [`src/protocol.ts`](src/protocol.ts), mirroring the
 Rust side (`../src/serve.rs` + the `Event` enum). Monorepo layout keeps both in
 lockstep — see [`../docs/VSCODE_EXTENSION_DESIGN_QUESTIONS.md`](../docs/VSCODE_EXTENSION_DESIGN_QUESTIONS.md).
 
+### Relationship to kotonia-desktop
+
+`kotonia-desktop` links `kotonia-cli` as a Rust path dependency and drives
+`DispatchAgent` in-process. VS Code extensions run on a TypeScript/Node
+extension host, so this extension still needs a process boundary (`--serve`) or
+a native addon. The target architecture is therefore:
+
+- keep the ReAct engine, provider resolution, worktree setup, history, approval
+  policy, and login helpers in the `kotonia-cli` library;
+- keep `kotonia-cli --serve` as the thin helper binary for VS Code;
+- avoid reimplementing engine assembly in TypeScript. The extension should only
+  spawn/configure the helper and render the protocol.
+
+If CLI and desktop drift, factor the shared setup into a library builder first,
+then have `main.rs`, `kotonia-desktop`, and `serve` call that same builder.
+
 ## Where things run (important)
 
 The engine needs `bash`, `git`, and (for local models) the LLM servers — all on

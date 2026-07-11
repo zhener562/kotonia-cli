@@ -1,0 +1,104 @@
+name: Publish VS Code Extension
+
+on:
+  workflow_dispatch:
+    inputs:
+      cli_tag:
+        description: "kotonia-cli release tag to bundle. Empty = kotonia-cli.version"
+        required: false
+        type: string
+      publish_marketplace:
+        description: "Publish to Visual Studio Marketplace if VSCE_PAT is configured"
+        required: false
+        default: false
+        type: boolean
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            cli_asset: kotonia-cli-linux-x64.tar.gz
+          - target: linux-arm64
+            cli_asset: kotonia-cli-linux-arm64.tar.gz
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Resolve CLI release tag
+        id: cli
+        env:
+          CLI_TAG_INPUT: ${{ github.event.inputs.cli_tag }}
+        run: |
+          if [ -n "${CLI_TAG_INPUT:-}" ]; then
+            tag="$CLI_TAG_INPUT"
+          else
+            tag="$(tr -d '[:space:]' < kotonia-cli.version)"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Using kotonia-cli $tag"
+
+      - name: Download CLI helper
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist/cli bin
+          gh release download "${{ steps.cli.outputs.tag }}" \
+            --repo zhener562/kotonia-cli \
+            --pattern "${{ matrix.cli_asset }}" \
+            --dir dist/cli
+          tar -xzf "dist/cli/${{ matrix.cli_asset }}" -C bin
+          chmod +x bin/kotonia-cli
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Compile
+        run: npm run compile
+
+      - name: Package VSIX
+        run: |
+          mkdir -p dist/vsix
+          npx vsce package --target ${{ matrix.target }} --out "dist/vsix/kotonia-agent-${{ matrix.target }}.vsix"
+
+      - name: Upload VSIX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kotonia-agent-${{ matrix.target }}
+          path: dist/vsix/*.vsix
+          if-no-files-found: error
+
+      - name: Publish GitHub release asset
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/vsix/*.vsix
+          fail_on_unmatched_files: true
+
+      - name: Publish Marketplace package
+        if: startsWith(github.ref, 'refs/tags/') || github.event.inputs.publish_marketplace == 'true'
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: |
+          if [ -z "${VSCE_PAT:-}" ]; then
+            echo "VSCE_PAT is not configured; skipping Marketplace publish."
+            exit 0
+          fi
+          npx vsce publish --packagePath "dist/vsix/kotonia-agent-${{ matrix.target }}.vsix"

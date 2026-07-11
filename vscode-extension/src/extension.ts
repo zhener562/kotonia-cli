@@ -682,7 +682,17 @@ function pickWorkspaceFolder(): vscode.WorkspaceFolder | undefined {
 }
 
 function resolveBinary(raw: string, folder: vscode.WorkspaceFolder): string {
-  return raw.replace(/\$\{workspaceFolder\}/g, folder.uri.fsPath);
+  const expanded = raw.replace(/\$\{workspaceFolder\}/g, folder.uri.fsPath).trim();
+  if (!expanded || expanded === "kotonia-cli") {
+    return bundledEnginePath() ?? (expanded || "kotonia-cli");
+  }
+  return expanded;
+}
+
+function bundledEnginePath(): string | undefined {
+  const exe = process.platform === "win32" ? "kotonia-cli.exe" : "kotonia-cli";
+  const candidate = path.join(extContext.extensionPath, "bin", exe);
+  return fs.existsSync(candidate) ? candidate : undefined;
 }
 
 async function gatherEnv(): Promise<Record<string, string>> {

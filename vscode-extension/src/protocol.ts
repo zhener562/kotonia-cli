@@ -37,9 +37,11 @@ export interface ExecutionResult {
 export type EngineEvent =
   | ({ type: "iteration_start"; iteration: number; max: number } & WithTurn)
   | ({ type: "llm_thinking" } & WithTurn)
+  | ({ type: "text"; text: string } & WithTurn)
   | ({ type: "bash"; command: string } & WithTurn)
   | ({ type: "bash_skipped"; command: string; reason: string } & WithTurn)
   | ({ type: "observation"; result: ExecutionResult } & WithTurn)
+  | ({ type: "inspect_image"; path: string; size_bytes: number; error?: string | null } & WithTurn)
   | ({ type: "final"; answer: string } & WithTurn)
   | ({ type: "malformed"; excerpt: string } & WithTurn)
   | ({ type: "error"; message: string } & WithTurn)
