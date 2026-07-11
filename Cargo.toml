@@ -1,6 +1,6 @@
 [package]
 name = "kotonia-cli"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "MIT"
 description = "Local shell agent backed by self-hosted or hosted LLMs (ReAct + native tool calling)."
