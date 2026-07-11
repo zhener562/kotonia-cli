@@ -111,8 +111,7 @@ pub trait Notifier: Send + Sync {
 // ── persistence ─────────────────────────────────────────────────────────
 
 pub fn notifier_config_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".kotonia").join("notifier.json"))
+    Some(dirs::home_dir()?.join(".kotonia").join("notifier.json"))
 }
 
 pub fn load_notifier_config() -> Option<NotifierStoredConfig> {
