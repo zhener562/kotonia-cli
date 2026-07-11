@@ -463,16 +463,18 @@ function runLogin(): void {
   output.appendLine("[login] starting device-code flow");
 
   const child = spawn(binary, ["login"], { cwd: folder.uri.fsPath, env: process.env });
-  let uriOpened = false;
+  let verifyUri: string | undefined;
   let sawCodeLabel = false;
   let buf = "";
 
   const handleLine = (line: string): void => {
     output.appendLine(`[login] ${line}`);
     const url = line.match(/https?:\/\/\S+/);
-    if (!uriOpened && url) {
-      uriOpened = true;
-      void vscode.env.openExternal(vscode.Uri.parse(url[0]));
+    if (!verifyUri && url) {
+      // Hold the verification URL until we also have the code, then open the
+      // page with the code prefilled (`?code=…`) so the user just clicks
+      // Approve — no manual typing.
+      verifyUri = url[0];
       return;
     }
     if (/enter this code/i.test(line)) {
@@ -482,10 +484,14 @@ function runLogin(): void {
     if (sawCodeLabel && line.trim()) {
       const code = line.trim();
       sawCodeLabel = false;
+      const openUrl = verifyUri
+        ? `${verifyUri}${verifyUri.includes("?") ? "&" : "?"}code=${encodeURIComponent(code)}`
+        : undefined;
       void vscode.env.clipboard.writeText(code);
-      void vscode.window.showInformationMessage(
-        `Kotonia: enter code ${code} in the browser, then approve. (copied to clipboard)`,
-      );
+      if (openUrl) {
+        void vscode.env.openExternal(vscode.Uri.parse(openUrl));
+      }
+      promptLoginApproval(code, openUrl);
     }
   };
 
@@ -511,6 +517,25 @@ function runLogin(): void {
       );
     }
   });
+}
+
+/** A sticky (button-bearing) notification showing the login code, so it stays
+ * put while the user switches to the browser. With the prefilled URL the user
+ * usually only needs to click Approve; the buttons are a fallback. */
+function promptLoginApproval(code: string, url?: string): void {
+  void vscode.window
+    .showInformationMessage(
+      `Kotonia ログイン: ブラウザで「Approve」を押すとサインイン完了です。コード ${code} は自動入力＆クリップボードにコピー済み（未対応環境では貼り付けてください）。`,
+      "コードをコピー",
+      "ログインページを開く",
+    )
+    .then((choice) => {
+      if (choice === "コードをコピー") {
+        void vscode.env.clipboard.writeText(code);
+      } else if (choice === "ログインページを開く" && url) {
+        void vscode.env.openExternal(vscode.Uri.parse(url));
+      }
+    });
 }
 
 // ---- helpers ---------------------------------------------------------------
