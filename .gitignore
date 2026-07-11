@@ -1,3 +1,7 @@
 /target
 .DS_Store
 *.bk
+
+# Cargo home used by the Docker build wrapper (SAC blocks native builds on the
+# Windows dev machine; we cargo check via rust:1.95).
+/.cargo-docker

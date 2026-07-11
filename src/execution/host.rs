@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
+use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::time::timeout;
@@ -35,7 +36,7 @@ impl std::fmt::Display for HostExecutorError {
 
 impl std::error::Error for HostExecutorError {}
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ExecutionResult {
     pub exit_code: i32,
     pub timed_out: bool,
