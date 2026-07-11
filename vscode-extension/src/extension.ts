@@ -322,13 +322,22 @@ async function speak(text: string): Promise<void> {
   const abort = new AbortController();
   speakAbort = abort;
 
+  // Numeric speaker ids (AivisSpeech / VoiceVox style) must go over the wire
+  // as numbers — the ditto→TTS proxy forwards `speaker` verbatim and the
+  // engine expects an int for those backends.
+  const speakerStr = cfg.get<string>("avatar.speaker", "").trim();
+  const speaker: string | number | undefined = speakerStr
+    ? /^\d+$/.test(speakerStr)
+      ? Number(speakerStr)
+      : speakerStr
+    : undefined;
   const body = {
     text,
     avatar_id: avatarId,
-    tts_backend: cfg.get<string>("avatar.ttsBackend", "qwen3"),
+    tts_backend: cfg.get<string>("avatar.ttsBackend", "aivis"),
     language: cfg.get<string>("avatar.language", "ja"),
-    speaker: cfg.get<string>("avatar.speaker", "") || undefined,
-    speed: 1.0,
+    speaker,
+    speed: cfg.get<number>("avatar.speed", 1.2),
     fps: 25,
   };
 

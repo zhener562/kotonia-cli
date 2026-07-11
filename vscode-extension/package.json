@@ -2,7 +2,7 @@
   "name": "kotonia-agent",
   "displayName": "Kotonia Agent",
   "description": "%extension.description%",
-  "version": "0.0.11",
+  "version": "0.0.12",
   "publisher": "kotonia",
   "icon": "media/icon.png",
   "repository": {
@@ -205,13 +205,18 @@
             "voicevox",
             "aivis"
           ],
-          "default": "qwen3",
-          "description": "TTS backend the avatar voice uses."
+          "default": "aivis",
+          "description": "TTS backend the avatar voice uses. The Kotona mascot uses AivisSpeech."
         },
         "kotonia.avatar.speaker": {
           "type": "string",
-          "default": "",
-          "description": "Optional speaker/voice id passed to the TTS backend (backend-specific; leave empty for the default)."
+          "default": "888753762",
+          "description": "Speaker/voice id passed to the TTS backend (backend-specific). Numeric ids (e.g. AivisSpeech まお-あまあま = 888753762) are sent as numbers. Empty = backend default."
+        },
+        "kotonia.avatar.speed": {
+          "type": "number",
+          "default": 1.2,
+          "description": "Speech speed for the avatar voice (1.0 = normal)."
         },
         "kotonia.avatar.language": {
           "type": "string",
