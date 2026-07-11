@@ -1,9 +1,10 @@
 {
   "name": "kotonia-agent",
   "displayName": "Kotonia Agent",
-  "description": "Drive the kotonia-cli shell agent from VS Code — a thin client over the Rust engine's JSON stdio protocol.",
-  "version": "0.0.1",
+  "description": "%extension.description%",
+  "version": "0.0.10",
   "publisher": "kotonia",
+  "icon": "media/icon.png",
   "repository": {
     "type": "git",
     "url": "https://github.com/zhener562/kotonia-cli"
@@ -16,32 +17,128 @@
     "Machine Learning"
   ],
   "main": "./out/extension.js",
+  "extensionKind": [
+    "workspace"
+  ],
   "activationEvents": [],
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "kotonia",
+          "title": "Kotonia",
+          "icon": "media/flame.svg"
+        }
+      ]
+    },
+    "views": {
+      "kotonia": [
+        {
+          "id": "kotonia.sessions",
+          "name": "%view.sessions.name%"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "kotonia.newChat",
+          "when": "view == kotonia.sessions",
+          "group": "navigation@1"
+        },
+        {
+          "command": "kotonia.refreshSessions",
+          "when": "view == kotonia.sessions",
+          "group": "navigation@2"
+        },
+        {
+          "command": "kotonia.newChat",
+          "when": "view == kotonia.sessions",
+          "group": "0_session@1"
+        },
+        {
+          "command": "kotonia.refreshSessions",
+          "when": "view == kotonia.sessions",
+          "group": "0_session@2"
+        },
+        {
+          "command": "kotonia.login",
+          "when": "view == kotonia.sessions",
+          "group": "1_auth"
+        },
+        {
+          "command": "kotonia.toggleAvatar",
+          "when": "view == kotonia.sessions",
+          "group": "1_auth"
+        },
+        {
+          "command": "kotonia.reviewChanges",
+          "when": "view == kotonia.sessions",
+          "group": "2_worktree"
+        },
+        {
+          "command": "kotonia.applyChanges",
+          "when": "view == kotonia.sessions",
+          "group": "2_worktree"
+        }
+      ]
+    },
     "commands": [
       {
         "command": "kotonia.start",
-        "title": "Kotonia: Open Agent",
+        "title": "%cmd.start.title%",
         "category": "Kotonia"
       },
       {
-        "command": "kotonia.newSession",
-        "title": "Kotonia: New Session (restart engine)",
+        "command": "kotonia.newChat",
+        "title": "%cmd.newChat.title%",
+        "category": "Kotonia",
+        "icon": "$(add)"
+      },
+      {
+        "command": "kotonia.refreshSessions",
+        "title": "%cmd.refreshSessions.title%",
+        "category": "Kotonia",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "kotonia.openSession",
+        "title": "%cmd.openSession.title%",
+        "category": "Kotonia"
+      },
+      {
+        "command": "kotonia.login",
+        "title": "%cmd.login.title%",
+        "category": "Kotonia"
+      },
+      {
+        "command": "kotonia.toggleAvatar",
+        "title": "%cmd.toggleAvatar.title%",
         "category": "Kotonia"
       },
       {
         "command": "kotonia.cancel",
-        "title": "Kotonia: Cancel Current Turn",
+        "title": "%cmd.cancel.title%",
+        "category": "Kotonia"
+      },
+      {
+        "command": "kotonia.reviewChanges",
+        "title": "%cmd.reviewChanges.title%",
+        "category": "Kotonia"
+      },
+      {
+        "command": "kotonia.applyChanges",
+        "title": "%cmd.applyChanges.title%",
         "category": "Kotonia"
       },
       {
         "command": "kotonia.setKotoniaApiKey",
-        "title": "Kotonia: Set Kotonia API Key",
+        "title": "%cmd.setKotoniaApiKey.title%",
         "category": "Kotonia"
       },
       {
         "command": "kotonia.setDeepSeekApiKey",
-        "title": "Kotonia: Set DeepSeek API Key",
+        "title": "%cmd.setDeepSeekApiKey.title%",
         "category": "Kotonia"
       }
     ],
@@ -84,6 +181,47 @@
           },
           "default": [],
           "description": "Extra CLI arguments appended to the engine spawn (e.g. [\"--max-iterations\", \"50\"])."
+        },
+        "kotonia.language": {
+          "type": "string",
+          "default": "ja",
+          "markdownDescription": "Default reply language for the agent (BCP-47-ish code, e.g. `ja`, `en`, `zh`). Injected as a one-line instruction on the first turn of each session; the agent still switches if you write in another language. Empty = no language steering."
+        },
+        "kotonia.avatar.enabled": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Show a talking lip-sync avatar (Ditto) that speaks each final answer. Streams from kotonia.ai `/api/voice/ditto/tts/stream/avatar` using your device login. Requires a registered `kotonia.avatar.id` and the Ditto/TTS servers running."
+        },
+        "kotonia.avatar.id": {
+          "type": "string",
+          "default": "kotona_v4",
+          "markdownDescription": "Registered Ditto avatar id. Defaults to the Kotona mascot (`kotona_v4`; `kotona_v1`–`v3` also exist). Register your own via the Kotonia web UI / `/api/voice/ditto/prepare`."
+        },
+        "kotonia.avatar.ttsBackend": {
+          "type": "string",
+          "enum": [
+            "qwen3",
+            "irodori",
+            "voicevox",
+            "aivis"
+          ],
+          "default": "qwen3",
+          "description": "TTS backend the avatar voice uses."
+        },
+        "kotonia.avatar.speaker": {
+          "type": "string",
+          "default": "",
+          "description": "Optional speaker/voice id passed to the TTS backend (backend-specific; leave empty for the default)."
+        },
+        "kotonia.avatar.language": {
+          "type": "string",
+          "default": "ja",
+          "description": "Language hint for the TTS backend (e.g. ja, en, zh)."
+        },
+        "kotonia.avatar.apiBase": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Override the API base for avatar streaming. Empty = use the server from your device login (`~/.kotonia/daemon.json`), falling back to `https://kotonia.ai`."
         }
       }
     }

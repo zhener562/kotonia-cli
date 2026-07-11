@@ -1,0 +1,15 @@
+{
+  "extension.description": "kotonia-cli シェルエージェントを VS Code から操作する薄いクライアント（Rust エンジンの JSON stdio プロトコル経由）。",
+  "view.sessions.name": "セッション",
+  "cmd.start.title": "Kotonia: エージェントを開く（新規チャット）",
+  "cmd.newChat.title": "新規チャット",
+  "cmd.refreshSessions.title": "セッション一覧を更新",
+  "cmd.openSession.title": "Kotonia: セッションを開く",
+  "cmd.login.title": "Kotonia: ログイン（デバイスコード）",
+  "cmd.toggleAvatar.title": "Kotonia: 喋るアバターの切り替え",
+  "cmd.cancel.title": "Kotonia: 現在のターンを中止",
+  "cmd.reviewChanges.title": "Kotonia: エージェントの変更を確認（worktree 差分）",
+  "cmd.applyChanges.title": "Kotonia: 変更をワークスペースに適用",
+  "cmd.setKotoniaApiKey.title": "Kotonia: Kotonia API キーを設定",
+  "cmd.setDeepSeekApiKey.title": "Kotonia: DeepSeek API キーを設定"
+}

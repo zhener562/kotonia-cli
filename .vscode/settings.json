@@ -6,5 +6,6 @@
   "kotonia.model": "kotonia-gemma4-26b",
   // in-place for the first test so the agent's edits show live in the editor.
   // Switch to "worktree" for isolated (review-before-merge) runs.
-  "kotonia.workspaceMode": "in-place"
+  "kotonia.workspaceMode": "in-place",
+  "kotonia.avatar.enabled": true
 }
