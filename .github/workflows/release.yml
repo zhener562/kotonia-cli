@@ -74,7 +74,7 @@ jobs:
           mkdir -p dist "${{ runner.temp }}/kotonia-cli"
           cp "target/${{ matrix.target }}/release/kotonia-cli" "${{ runner.temp }}/kotonia-cli/"
           tar -C "${{ runner.temp }}/kotonia-cli" -czf "dist/${{ matrix.asset }}.tar.gz" kotonia-cli
-          sha256sum "dist/${{ matrix.asset }}.tar.gz" > "dist/${{ matrix.asset }}.tar.gz.sha256"
+          shasum -a 256 "dist/${{ matrix.asset }}.tar.gz" > "dist/${{ matrix.asset }}.tar.gz.sha256"
 
       - name: Package Windows archive
         if: runner.os == 'Windows'
@@ -82,6 +82,7 @@ jobs:
         run: |
           $staging = Join-Path $env:RUNNER_TEMP 'kotonia-cli'
           New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          New-Item -ItemType Directory -Force -Path 'dist' | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/kotonia-cli.exe" "$staging/kotonia-cli.exe"
           Compress-Archive -Path "$staging/kotonia-cli.exe" -DestinationPath "dist/${{ matrix.asset }}.zip"
           $hash = (Get-FileHash "dist/${{ matrix.asset }}.zip" -Algorithm SHA256).Hash.ToLower()
