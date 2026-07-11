@@ -53,10 +53,7 @@ pub async fn create_with_tools(
     messages: Vec<AiMessage>,
     options: AiCallOptions,
 ) -> Result<AiResponse, AiError> {
-    let url = format!(
-        "{}/chat/completions",
-        config.api_base.trim_end_matches('/')
-    );
+    let url = format!("{}/chat/completions", config.api_base.trim_end_matches('/'));
     let body = build_request_body(config.clone(), messages, options)?;
 
     let mut req = client
@@ -198,12 +195,41 @@ fn content_text_only(content: &[AiContent], role: &str) -> Result<String, AiErro
 }
 
 fn user_message_to_wire(content: &[AiContent]) -> Result<Value, AiError> {
-    // kotonia-cli is text-only: every block must be text, no image variants
-    // exist in this crate's AiContent. Multimodal support can be added back
-    // by re-introducing image variants and a parts-array fallback.
+    let has_non_text = content.iter().any(|c| !matches!(c, AiContent::Text { .. }));
+    if !has_non_text {
+        return Ok(json!({
+            "role": "user",
+            "content": content_text_only(content, "user")?,
+        }));
+    }
+
+    // Multimodal: emit the parts-array form. Text and image blocks both
+    // belong in user messages; other block kinds are invalid here.
+    let mut parts = Vec::new();
+    for block in content {
+        match block {
+            AiContent::Text { text } => parts.push(json!({
+                "type": "text",
+                "text": text,
+            })),
+            AiContent::Image { media_type, data } => parts.push(json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": format!("data:{media_type};base64,{data}")
+                }
+            })),
+            _ => {
+                return Err(AiError::Invalid(
+                    "user messages only support text and image content in OpenAI-compatible adapter"
+                        .into(),
+                ));
+            }
+        }
+    }
+
     Ok(json!({
         "role": "user",
-        "content": content_text_only(content, "user")?,
+        "content": parts,
     }))
 }
 
@@ -530,6 +556,34 @@ mod tests {
             json!({
                 "type": "function",
                 "function": {"name": "python_execute"},
+            })
+        );
+    }
+
+    #[test]
+    fn serializes_user_image_parts() {
+        let value = user_message_to_wire(&[
+            AiContent::Text {
+                text: "look".into(),
+            },
+            AiContent::Image {
+                media_type: "image/png".into(),
+                data: "abc123".into(),
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(
+            value,
+            json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "look"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64,abc123"}
+                    }
+                ]
             })
         );
     }

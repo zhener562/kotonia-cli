@@ -31,6 +31,14 @@ pub enum AiContent {
     Text {
         text: String,
     },
+    /// Inline image. Encoded as base64 (no `data:` prefix). On the OpenAI
+    /// wire this turns into an `image_url` part inside a user message.
+    Image {
+        /// e.g. "image/png", "image/jpeg", "image/webp"
+        media_type: String,
+        /// Base64-encoded bytes (no `data:...;base64,` prefix).
+        data: String,
+    },
     /// Assistant requests a tool invocation.
     ToolUse {
         id: String,
@@ -206,7 +214,10 @@ impl AiCallOptions {
 #[derive(Debug)]
 pub enum AiError {
     Http(String),
-    Api { status: Option<u16>, message: String },
+    Api {
+        status: Option<u16>,
+        message: String,
+    },
     Parse(String),
     Invalid(String),
 }
