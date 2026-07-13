@@ -163,7 +163,7 @@
         "kotonia.model": {
           "type": "string",
           "default": "kotonia-gemma4-26b",
-          "markdownDescription": "Model id passed to the engine. Hosted (GPU-free, needs `KOTONIA_API_KEY`): `kotonia-gemma4-26b`, `kotonia-v4-flash`. Local: `gemma4-26b-uncensored`, `deepseek-v4-flash`. DeepSeek API: `deepseek-chat`, `deepseek-reasoner`."
+          "markdownDescription": "Model id passed to the engine. Hosted via kotonia.ai (needs `KOTONIA_API_KEY`): `kotonia-gemma4-26b`, `kotonia-thinkcap-27b` (append `:nothink` to skip the reasoning pass). DeepSeek API (needs `DEEPSEEK_API_KEY`): `deepseek-chat`, `deepseek-reasoner`. Custom endpoints can be added via `~/.kotonia/providers.json`."
         },
         "kotonia.approvalMode": {
           "type": "string",
