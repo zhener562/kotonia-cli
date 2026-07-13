@@ -931,28 +931,46 @@ impl Agent {
                 MAX_INSPECT_BYTES
             ));
         }
-        let media_type = match canonical
-            .extension()
-            .and_then(|s| s.to_str())
-            .map(|s| s.to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("png") => "image/png",
-            Some("jpg") | Some("jpeg") => "image/jpeg",
-            Some("webp") => "image/webp",
-            Some("gif") => "image/gif",
-            other => {
-                return Err(format!(
-                    "unsupported image type `{:?}` (expected png/jpg/jpeg/webp/gif)",
-                    other
-                ))
-            }
-        };
         let bytes = std::fs::read(&canonical)
             .map_err(|e| format!("cannot read `{}`: {e}", canonical.display()))?;
+        // Detect the image type from the file contents, not the extension. A
+        // `.png` that is really a JSON API response (or any non-image) would
+        // otherwise be attached as `image/png` and rejected by the model API
+        // with an opaque 400 — and, worse, the bad attachment sticks in the
+        // conversation history and poisons every later turn. On a content
+        // mismatch we return Err, which the caller surfaces to the model as a
+        // tool error (no image attached, the turn continues) so it can
+        // self-correct.
+        let media_type = sniff_image_media_type(&bytes).ok_or_else(|| {
+            let head: Vec<String> = bytes.iter().take(8).map(|b| format!("{b:02x}")).collect();
+            format!(
+                "`{path}` is not a valid image (first bytes: {}). Expected \
+                 png/jpeg/webp/gif. If this is an image-generation API response, \
+                 extract the base64/binary image out of it first.",
+                head.join(" ")
+            )
+        })?;
         let size_bytes = bytes.len() as u64;
         let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
         Ok((media_type.to_string(), data, size_bytes))
+    }
+}
+
+/// Detect a supported image type from its leading magic bytes. Returns the
+/// wire media type, or None if the content is not a recognised image. Used by
+/// `inspect_image` so a mislabelled file (e.g. JSON saved as `.png`) is
+/// rejected before it reaches the model instead of failing the whole request.
+fn sniff_image_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
     }
 }
 
@@ -1176,6 +1194,28 @@ impl std::error::Error for AgentError {}
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn sniff_image_recognises_real_formats() {
+        assert_eq!(
+            sniff_image_media_type(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00]),
+            Some("image/png")
+        );
+        assert_eq!(
+            sniff_image_media_type(&[0xFF, 0xD8, 0xFF, 0xE0]),
+            Some("image/jpeg")
+        );
+        assert_eq!(sniff_image_media_type(b"GIF89a...."), Some("image/gif"));
+        assert_eq!(sniff_image_media_type(b"RIFF\0\0\0\0WEBPVP8 "), Some("image/webp"));
+    }
+
+    #[test]
+    fn sniff_image_rejects_non_images() {
+        // A JSON API response saved as `kawaii.png` — the bug this guards.
+        assert_eq!(sniff_image_media_type(br#"{"created":1,"data":[{"#), None);
+        assert_eq!(sniff_image_media_type(b""), None);
+        assert_eq!(sniff_image_media_type(b"RIFF\0\0\0\0AVI "), None);
+    }
 
     #[test]
     fn final_answer_prefers_answer_argument() {
