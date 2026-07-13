@@ -37,9 +37,10 @@ jobs:
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             asset: kotonia-cli-linux-arm64
-          - os: macos-13
-            target: x86_64-apple-darwin
-            asset: kotonia-cli-darwin-x64
+          # Intel macOS (x86_64-apple-darwin) is intentionally dropped: Apple
+          # Silicon uses the arm64 asset, so only genuine Intel Macs would need
+          # this — and the macos-13 runner GitHub deprecated queues for a long
+          # time. Intel Mac falls back to a `kotonia-cli` on PATH.
           - os: macos-14
             target: aarch64-apple-darwin
             asset: kotonia-cli-darwin-arm64
