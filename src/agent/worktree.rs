@@ -119,6 +119,44 @@ impl AgentWorkspace {
         })
     }
 
+    /// Re-attach to a worktree preserved by an earlier `--keep-worktree`
+    /// session. This is used by machine frontends so closing/reopening chat
+    /// cannot silently fork away from uncommitted agent edits.
+    pub async fn resume_worktree(
+        launch_cwd: &Path,
+        worktree_root: &Path,
+    ) -> Result<Self, WorktreeError> {
+        if !worktree_root.exists() {
+            return Err(WorktreeError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("saved worktree does not exist: {}", worktree_root.display()),
+            )));
+        }
+
+        let launch_exec = HostExecutor::new(launch_cwd.to_path_buf());
+        let repo_root = run_git(&launch_exec, "git rev-parse --show-toplevel").await?;
+        let repo_root = PathBuf::from(repo_root.trim());
+
+        let worktree_exec = HostExecutor::new(worktree_root.to_path_buf());
+        let branch = run_git(&worktree_exec, "git branch --show-current").await?;
+        let branch = branch.trim().to_string();
+        if branch.is_empty() {
+            return Err(WorktreeError::GitFailed {
+                command: "git branch --show-current".to_string(),
+                output: "saved worktree is detached or invalid".to_string(),
+            });
+        }
+
+        Ok(Self {
+            root: worktree_root.to_path_buf(),
+            mode: WorkspaceMode::Worktree {
+                repo_root,
+                base_ref: "resumed".to_string(),
+                branch,
+            },
+        })
+    }
+
     /// Tear down the worktree. No-op for `in_place`.
     pub async fn cleanup(self, keep: bool) -> Result<(), WorktreeError> {
         match self.mode {
@@ -220,5 +258,29 @@ mod tests {
             .await
             .unwrap();
         assert!(check.combined.trim().is_empty());
+    }
+
+    #[tokio::test]
+    async fn preserved_worktree_can_be_resumed() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let setup = HostExecutor::new(repo.to_path_buf());
+        setup
+            .bash(
+                "git init -q && git config user.email a@b && git config user.name a \
+                 && echo hi > f.txt && git add f.txt && git commit -qm init",
+            )
+            .await
+            .unwrap();
+
+        let original = AgentWorkspace::create_worktree(repo, None).await.unwrap();
+        let root = original.root.clone();
+        let branch = original.branch().unwrap().to_string();
+        original.cleanup(true).await.unwrap();
+
+        let resumed = AgentWorkspace::resume_worktree(repo, &root).await.unwrap();
+        assert_eq!(resumed.root, root);
+        assert_eq!(resumed.branch(), Some(branch.as_str()));
+        resumed.cleanup(false).await.unwrap();
     }
 }

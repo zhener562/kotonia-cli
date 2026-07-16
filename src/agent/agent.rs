@@ -224,6 +224,17 @@ impl Agent {
         }
     }
 
+    /// Persist one operator-visible chat bubble separately from the model
+    /// transcript. Machine frontends use this to restore a clean conversation
+    /// without replaying tool summaries and observations.
+    pub fn append_ui_message(&mut self, role: &str, content: &str, turn_id: u64) {
+        if let Some(h) = &mut self.history {
+            if let Err(e) = h.append_ui_message(role, content, turn_id) {
+                eprintln!("kotonia-cli: history UI append failed: {e}");
+            }
+        }
+    }
+
     pub fn provider_label(&self) -> String {
         format!("{} ({})", self.provider.model_id(), self.provider.backend_label())
     }

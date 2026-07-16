@@ -21,6 +21,7 @@ use std::io::{self, BufRead, Write};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
+use serde::Serialize;
 
 use kotonia_cli::agent::agent::{
     Agent, AgentConfig, ApprovalHandler, ApprovalOutcome, Event, EventSink,
@@ -28,7 +29,10 @@ use kotonia_cli::agent::agent::{
 use kotonia_cli::agent::approval::ApprovalMode;
 use kotonia_cli::agent::claude_code::ClaudeCodeAgent;
 use kotonia_cli::agent::dispatch::DispatchAgent;
-use kotonia_cli::agent::history::{list_sessions, load_session_messages, HistoryStore};
+use kotonia_cli::agent::history::{
+    list_sessions, load_session_messages, load_session_metadata, load_session_transcript,
+    HistoryStore,
+};
 use kotonia_cli::agent::provider::Provider;
 use kotonia_cli::agent::worktree::AgentWorkspace;
 use kotonia_cli::config as daemon_config;
@@ -62,6 +66,14 @@ enum Cmd {
     /// ~/.kotonia/daemon.json so subsequent `daemon` runs need no flags.
     Login(LoginArgs),
 
+    /// Report the shared kotonia.ai credential state. `--validate` performs
+    /// a non-rotating server check so stale/expired device tokens do not look
+    /// logged in merely because daemon.json still exists.
+    AuthStatus(AuthStatusArgs),
+
+    /// Remove the shared device credentials from ~/.kotonia/daemon.json.
+    Logout(LogoutArgs),
+
     /// Run as a long-lived WS daemon that streams agent tasks issued from
     /// the paired kotonia.ai web UI. Reads credentials from
     /// ~/.kotonia/daemon.json (written by `login`) if not supplied via
@@ -80,6 +92,24 @@ struct LoginArgs {
     /// HTTP(S) base of the kotonia.ai backend to pair with.
     #[arg(long, default_value = "https://kotonia.ai", env = "KOTONIA_API_BASE")]
     server: String,
+}
+
+#[derive(Args, Debug)]
+struct AuthStatusArgs {
+    /// Emit one machine-readable JSON object.
+    #[arg(long)]
+    json: bool,
+
+    /// Validate the stored device token against the server.
+    #[arg(long)]
+    validate: bool,
+}
+
+#[derive(Args, Debug)]
+struct LogoutArgs {
+    /// Emit one machine-readable JSON object.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -256,6 +286,8 @@ async fn main() -> ExitCode {
     match cli.cmd {
         Some(Cmd::Daemon(args)) => return run_daemon(args).await,
         Some(Cmd::Login(args)) => return run_login(args).await,
+        Some(Cmd::AuthStatus(args)) => return run_auth_status(args).await,
+        Some(Cmd::Logout(args)) => return run_logout(args),
         Some(Cmd::PairNotifier(args)) => return run_pair_notifier(args).await,
         None => {}
     }
@@ -299,8 +331,46 @@ async fn main() -> ExitCode {
         }
     };
 
+    // Resolve session_id up front; the ClaudeCode engine needs it for
+    // `--session-id` / `--resume`, and the ReAct path uses it for history.
+    let session_id = cli
+        .session
+        .clone()
+        .or_else(|| cli.resume.clone())
+        .unwrap_or_else(new_session_id);
+
+    let resume_meta = cli
+        .resume
+        .as_deref()
+        .and_then(|id| load_session_metadata(id).ok());
     let workspace = if cli.in_place {
-        AgentWorkspace::in_place(launch_cwd)
+        AgentWorkspace::in_place(launch_cwd.clone())
+    } else if let Some(meta) = resume_meta.as_ref().filter(|m| !m.in_place) {
+        match AgentWorkspace::resume_worktree(&launch_cwd, &meta.workspace).await {
+            Ok(w) => {
+                eprintln!(
+                    "resumed saved worktree for session `{}`: {}",
+                    meta.id,
+                    w.root.display()
+                );
+                w
+            }
+            Err(e) => {
+                eprintln!(
+                    "kotonia-cli: saved worktree for `{}` is unavailable ({e}); \
+                     creating a fresh worktree",
+                    meta.id
+                );
+                match AgentWorkspace::create_worktree(&launch_cwd, cli.base_ref.as_deref()).await {
+                    Ok(w) => w,
+                    Err(e) => {
+                        eprintln!("kotonia-cli: failed to create worktree: {e}");
+                        eprintln!("   (hint: pass --in-place to operate on the cwd directly)");
+                        return ExitCode::from(1);
+                    }
+                }
+            }
+        }
     } else {
         match AgentWorkspace::create_worktree(&launch_cwd, cli.base_ref.as_deref()).await {
             Ok(w) => w,
@@ -311,14 +381,7 @@ async fn main() -> ExitCode {
             }
         }
     };
-
-    // Resolve session_id up front; the ClaudeCode engine needs it for
-    // `--session-id` / `--resume`, and the ReAct path uses it for history.
-    let session_id = cli
-        .session
-        .clone()
-        .or_else(|| cli.resume.clone())
-        .unwrap_or_else(new_session_id);
+    let in_place = !workspace.is_worktree();
 
     // The kotonia /api/v1 helper banner only applies to the ReAct prompt
     // (the model is told it can shell out to the API). ClaudeCode runs its
@@ -335,9 +398,10 @@ async fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
-            let mut config = AgentConfig::new(approval_mode, cli.in_place);
+            let mut config = AgentConfig::new(approval_mode, in_place);
             config.max_iterations = cli.max_iterations;
             config.force_delimiter = cli.force_delimiter;
+            config.persona_prefix = frontend_system_prompt_prefix();
             config.kotonia_api_base = if std::env::var("KOTONIA_API_KEY").is_ok() {
                 Some(
                     std::env::var("KOTONIA_API_BASE")
@@ -356,7 +420,7 @@ async fn main() -> ExitCode {
             DispatchAgent::ClaudeCode(ClaudeCodeAgent::new(
                 &workspace.root,
                 claude_session_id,
-                cli.in_place,
+                in_place,
             ))
         }
     };
@@ -372,7 +436,7 @@ async fn main() -> ExitCode {
                         agent.backend_label(),
                         &approval_mode.to_string(),
                         &workspace.root,
-                        cli.in_place,
+                        in_place,
                     );
                 }
                 agent = agent.with_history(store);
@@ -421,6 +485,11 @@ async fn main() -> ExitCode {
                     is_worktree: workspace.is_worktree(),
                     session_id: react_agent.session_id().map(|s| s.to_string()),
                     kotonia_api: kotonia_api_enabled,
+                    history: cli
+                        .resume
+                        .as_deref()
+                        .and_then(|id| load_session_transcript(id).ok())
+                        .unwrap_or_default(),
                 };
                 serve::serve(react_agent, hello).await;
                 cleanup_workspace(workspace, cli.keep_worktree, cli.quiet_shutdown).await;
@@ -473,6 +542,29 @@ async fn main() -> ExitCode {
 
     cleanup_workspace(workspace, cli.keep_worktree, cli.quiet_shutdown).await;
     exit_code
+}
+
+fn frontend_system_prompt_prefix() -> Option<String> {
+    let mut blocks = Vec::new();
+    if let Ok(persona) = std::env::var("KOTONIA_PERSONA_PREFIX") {
+        if !persona.trim().is_empty() {
+            blocks.push(persona.trim().to_string());
+        }
+    }
+    if let Ok(language) = std::env::var("KOTONIA_REPLY_LANGUAGE") {
+        let language = language.trim();
+        if !language.is_empty() {
+            let instruction = if language == "ja" {
+                "デフォルトでは日本語で回答してください。ユーザーが他の言語で書いた場合は、その言語で回答してください。".to_string()
+            } else {
+                format!(
+                    "Reply in \"{language}\" by default. If the user writes in another language, reply in that language instead."
+                )
+            };
+            blocks.push(instruction);
+        }
+    }
+    (!blocks.is_empty()).then(|| blocks.join("\n\n"))
 }
 
 async fn repl(
@@ -702,6 +794,163 @@ async fn run_login(args: LoginArgs) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("kotonia-cli login: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct AuthStatusOutput {
+    logged_in: bool,
+    source: &'static str,
+    valid: Option<bool>,
+    server: Option<String>,
+    device_id_prefix: Option<String>,
+    error: Option<String>,
+}
+
+async fn run_auth_status(args: AuthStatusArgs) -> ExitCode {
+    let stored = daemon_config::load();
+    let env_key = std::env::var("KOTONIA_API_KEY")
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+
+    let mut output = if let Some(cfg) = stored.as_ref() {
+        AuthStatusOutput {
+            logged_in: true,
+            source: "device",
+            valid: None,
+            server: Some(cfg.server.clone()),
+            device_id_prefix: Some(cfg.device_id.chars().take(8).collect()),
+            error: None,
+        }
+    } else if env_key.is_some() {
+        AuthStatusOutput {
+            logged_in: true,
+            source: "api_key",
+            valid: None,
+            server: std::env::var("KOTONIA_API_BASE").ok(),
+            device_id_prefix: None,
+            error: None,
+        }
+    } else {
+        AuthStatusOutput {
+            logged_in: false,
+            source: "none",
+            valid: None,
+            server: None,
+            device_id_prefix: None,
+            error: None,
+        }
+    };
+
+    if args.validate {
+        if let Some(cfg) = stored.as_ref() {
+            match validate_device_auth(cfg).await {
+                Ok(valid) => {
+                    output.valid = Some(valid);
+                    output.logged_in = valid;
+                }
+                Err(e) => output.error = Some(e),
+            }
+        }
+    }
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string(&output).unwrap_or_else(|_| {
+                r#"{"logged_in":false,"source":"none","valid":null}"#.to_string()
+            })
+        );
+    } else if output.logged_in {
+        let validity = match output.valid {
+            Some(true) => "validated",
+            Some(false) => "invalid",
+            None => "not validated",
+        };
+        println!(
+            "logged in via {} ({validity}){}",
+            output.source,
+            output
+                .device_id_prefix
+                .as_deref()
+                .map(|id| format!(", device {id}"))
+                .unwrap_or_default()
+        );
+        if let Some(error) = output.error.as_deref() {
+            eprintln!("validation unavailable: {error}");
+        }
+    } else {
+        println!("not logged in");
+    }
+
+    if output.valid == Some(false) || !output.logged_in {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+async fn validate_device_auth(cfg: &daemon_config::DaemonStoredConfig) -> Result<bool, String> {
+    let url = format!(
+        "{}/api/agent-runtime/auth-status/{}",
+        cfg.server.trim_end_matches('/'),
+        cfg.device_id
+    );
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("http client: {e}"))?;
+    let response = client
+        .get(url)
+        .bearer_auth(&cfg.device_token)
+        .send()
+        .await
+        .map_err(|e| format!("auth status request: {e}"))?;
+    match response.status() {
+        status if status.is_success() => Ok(true),
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => Ok(false),
+        reqwest::StatusCode::NOT_FOUND => Err(
+            "server does not expose device auth-status yet; local credentials are present"
+                .to_string(),
+        ),
+        status => {
+            let body = response.text().await.unwrap_or_default();
+            Err(format!("auth status returned {status}: {body}"))
+        }
+    }
+}
+
+fn run_logout(args: LogoutArgs) -> ExitCode {
+    match daemon_config::remove() {
+        Ok(path) => {
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "logged_in": false,
+                        "removed": path.is_some(),
+                    })
+                );
+            } else {
+                println!("logged out");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            if args.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "logged_in": false,
+                        "removed": false,
+                        "error": e,
+                    })
+                );
+            } else {
+                eprintln!("kotonia-cli logout: {e}");
+            }
             ExitCode::from(1)
         }
     }

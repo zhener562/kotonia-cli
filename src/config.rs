@@ -53,6 +53,15 @@ pub fn save(cfg: &DaemonStoredConfig) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+pub fn remove() -> Result<Option<PathBuf>, String> {
+    let path = config_path().ok_or_else(|| "HOME is not set".to_string())?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(Some(path)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("remove {}: {e}", path.display())),
+    }
+}
+
 /// Returns `<home>/.kotonia/providers.json`, or None if the home dir can't be resolved.
 pub fn providers_path() -> Option<PathBuf> {
     Some(dirs::home_dir()?.join(".kotonia").join("providers.json"))

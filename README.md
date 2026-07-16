@@ -67,6 +67,12 @@ OAuth-style device-code flow:
 kotonia-cli login
 # prints a URL + code; approve from a logged-in browser tab.
 # Writes ~/.kotonia/daemon.json {server, device_id, device_token}.
+
+kotonia-cli auth-status --validate
+# verifies that a present token is still accepted by the server.
+
+kotonia-cli logout
+# removes the shared device credential.
 ```
 
 The stored `device_token` is reused as the bearer for **both** the
@@ -217,6 +223,9 @@ runs everything there. Your real working copy is untouched until you
 explicitly merge.
 
 Pass `--in-place` to disable that and run inside your launch `cwd`.
+Machine frontends can combine `--keep-worktree` with `--resume`; protocol
+v2 reattaches to the saved worktree when it still exists, so closing and
+reopening a UI does not discard uncommitted agent edits.
 
 ## The ReAct loop
 
