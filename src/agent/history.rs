@@ -20,6 +20,19 @@ use serde::{Deserialize, Serialize};
 
 use super::provider::{ChatMsg, ChatRole};
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TranscriptMessage {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionMetadata {
+    pub id: String,
+    pub workspace: PathBuf,
+    pub in_place: bool,
+}
+
 #[derive(Debug)]
 pub enum HistoryError {
     Io(std::io::Error),
@@ -75,6 +88,15 @@ enum LogEntry {
     Message {
         role: String,
         content: String,
+        ts: String,
+    },
+    /// A frontend-visible chat bubble. The regular `message` entries remain
+    /// the model/resume transcript and can contain tool summaries,
+    /// observations, or editor context. UI clients should prefer these rows.
+    UiMessage {
+        role: String,
+        content: String,
+        turn_id: u64,
         ts: String,
     },
     Observation {
@@ -163,6 +185,21 @@ impl HistoryStore {
         self.write_line(&entry)
     }
 
+    pub fn append_ui_message(
+        &mut self,
+        role: &str,
+        content: &str,
+        turn_id: u64,
+    ) -> Result<(), HistoryError> {
+        let entry = LogEntry::UiMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+            turn_id,
+            ts: now_iso(),
+        };
+        self.write_line(&entry)
+    }
+
     pub fn append_observation(
         &mut self,
         exit_code: i32,
@@ -239,6 +276,239 @@ pub fn load_session_messages_in(
         }
     }
     Ok(msgs)
+}
+
+pub fn load_session_metadata(session_id: &str) -> Result<SessionMetadata, HistoryError> {
+    load_session_metadata_in(HistoryStore::default_dir()?, session_id)
+}
+
+pub fn load_session_metadata_in(
+    dir: impl AsRef<Path>,
+    session_id: &str,
+) -> Result<SessionMetadata, HistoryError> {
+    let path = dir.as_ref().join(format!("{session_id}.jsonl"));
+    if !path.exists() {
+        return Err(HistoryError::SessionNotFound(session_id.to_string()));
+    }
+    let file = File::open(&path)?;
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        let entry: LogEntry = match serde_json::from_str(&line) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if let LogEntry::Session {
+            id,
+            workspace,
+            in_place,
+            ..
+        } = entry
+        {
+            return Ok(SessionMetadata {
+                id,
+                workspace: PathBuf::from(workspace),
+                in_place,
+            });
+        }
+    }
+    Err(HistoryError::SessionNotFound(session_id.to_string()))
+}
+
+/// Build the operator-visible chat transcript for history UIs.
+///
+/// Newer sessions contain explicit `ui_message` rows. Older logs are
+/// reconstructed best-effort from the model transcript, filtering tool
+/// observations and extracting `final_answer` tool calls. When both formats
+/// exist, matching legacy rows are de-duplicated in favour of the explicit UI
+/// row while preserving older turns from before protocol v2.
+pub fn load_session_transcript(
+    session_id: &str,
+) -> Result<Vec<TranscriptMessage>, HistoryError> {
+    load_session_transcript_in(HistoryStore::default_dir()?, session_id)
+}
+
+pub fn load_session_transcript_in(
+    dir: impl AsRef<Path>,
+    session_id: &str,
+) -> Result<Vec<TranscriptMessage>, HistoryError> {
+    let path = dir.as_ref().join(format!("{session_id}.jsonl"));
+    if !path.exists() {
+        return Err(HistoryError::SessionNotFound(session_id.to_string()));
+    }
+    let file = File::open(&path)?;
+    let reader = BufReader::new(file);
+
+    #[derive(Clone)]
+    struct Candidate {
+        line: usize,
+        explicit_ui: bool,
+        message: TranscriptMessage,
+        removed: bool,
+    }
+
+    let mut candidates = Vec::<Candidate>::new();
+    for (line_index, line) in reader.lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let entry: LogEntry = match serde_json::from_str(&line) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let message = match entry {
+            LogEntry::UiMessage { role, content, .. }
+                if (role == "user" || role == "assistant") && !content.trim().is_empty() =>
+            {
+                Some((true, TranscriptMessage { role, content }))
+            }
+            LogEntry::Message { role, content, .. } if role == "user" => {
+                legacy_user_message(&content).map(|content| {
+                    (
+                        false,
+                        TranscriptMessage {
+                            role: "user".to_string(),
+                            content,
+                        },
+                    )
+                })
+            }
+            LogEntry::Message { role, content, .. } if role == "assistant" => {
+                legacy_assistant_message(&content).map(|content| {
+                    (
+                        false,
+                        TranscriptMessage {
+                            role: "assistant".to_string(),
+                            content,
+                        },
+                    )
+                })
+            }
+            _ => None,
+        };
+        if let Some((explicit_ui, message)) = message {
+            candidates.push(Candidate {
+                line: line_index,
+                explicit_ui,
+                message,
+                removed: false,
+            });
+        }
+    }
+
+    // The model transcript and the explicit UI transcript are written near
+    // each other but not in a fixed order: user UI precedes `run_turn`, while
+    // assistant UI follows it. Match by role/content and remove the nearest
+    // legacy duplicate.
+    let ui_indexes: Vec<usize> = candidates
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| c.explicit_ui.then_some(i))
+        .collect();
+    for ui_index in ui_indexes {
+        let ui = &candidates[ui_index];
+        let best = candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                !c.explicit_ui
+                    && !c.removed
+                    && c.message.role == ui.message.role
+                    && c.message.content == ui.message.content
+            })
+            .min_by_key(|(_, c)| c.line.abs_diff(ui.line))
+            .map(|(i, _)| i);
+        if let Some(i) = best {
+            candidates[i].removed = true;
+        }
+    }
+
+    candidates.sort_by_key(|c| c.line);
+    Ok(candidates
+        .into_iter()
+        .filter(|c| !c.removed)
+        .map(|c| c.message)
+        .collect())
+}
+
+fn legacy_user_message(content: &str) -> Option<String> {
+    let mut text = content.trim();
+    if let Some((before, _)) = text.split_once("\n\n<!-- KOTONIA_EDITOR_CONTEXT_START -->") {
+        text = before.trim();
+    }
+    if text.is_empty()
+        || text.starts_with("[tool ")
+        || text.starts_with("[exit ")
+        || text.starts_with("Operator DENIED")
+        || text.starts_with("Your previous response did not contain")
+    {
+        return None;
+    }
+
+    // Protocol v1 injected language/persona instructions into the first user
+    // message. The language instruction was the final prefix immediately
+    // before the actual request, so trim through it when recognisable.
+    const JA_LANGUAGE: &str =
+        "デフォルトでは日本語で回答してください。ユーザーが他の言語で書いた場合は、その言語で回答してください。";
+    if let Some(pos) = text.rfind(JA_LANGUAGE) {
+        let after = text[pos + JA_LANGUAGE.len()..].trim();
+        if !after.is_empty() {
+            return Some(after.to_string());
+        }
+    }
+    if let Some(pos) = text.rfind("Reply in \"") {
+        let tail = &text[pos..];
+        const END: &str =
+            "If the user writes in another language, reply in that language instead.";
+        if let Some(end) = tail.find(END) {
+            let after = tail[end + END.len()..].trim();
+            if !after.is_empty() {
+                return Some(after.to_string());
+            }
+        }
+    }
+    Some(text.to_string())
+}
+
+fn legacy_assistant_message(content: &str) -> Option<String> {
+    let text = content.trim();
+    if text.is_empty() || text == "[empty assistant turn]" {
+        return None;
+    }
+
+    if let Some(start) = text.find("[tool_call final_answer(") {
+        let json_start = start + "[tool_call final_answer(".len();
+        let tail = &text[json_start..];
+        if let Some(json_end) = tail.find(")]") {
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&tail[..json_end]) {
+                if let Some(answer) = value.get("answer").and_then(|v| v.as_str()) {
+                    if !answer.trim().is_empty() {
+                        return Some(answer.trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(start) = text.find("<<<FINAL_ANSWER>>>") {
+        let tail = &text[start + "<<<FINAL_ANSWER>>>".len()..];
+        let answer = tail
+            .split("<<<END>>>")
+            .next()
+            .unwrap_or(tail)
+            .trim();
+        if !answer.is_empty() {
+            return Some(answer.to_string());
+        }
+    }
+
+    // Native tool-call summaries are internal reasoning/actions, not chat
+    // bubbles. Plain assistant text is retained for delimiter/legacy agents.
+    if text.contains("[tool_call ") {
+        None
+    } else {
+        Some(text.to_string())
+    }
 }
 
 /// List session ids in `~/.kotonia/sessions/`, newest-modified first. Used
@@ -324,5 +594,81 @@ mod tests {
         assert_eq!(listed.len(), 3);
         assert_eq!(listed[0].id, "c");
         assert_eq!(listed[2].id, "a");
+    }
+
+    #[test]
+    fn transcript_prefers_ui_rows_and_filters_tool_noise() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = HistoryStore::open_in(dir.path(), "ui-session").unwrap();
+        store.append_ui_message("user", "直して", 1).unwrap();
+        store
+            .append_message(
+                &ChatRole::User,
+                "直して\n\n<!-- KOTONIA_EDITOR_CONTEXT_START -->\n{\"active_file\":\"src/main.rs\"}",
+            )
+            .unwrap();
+        store
+            .append_message(
+                &ChatRole::Assistant,
+                r#"[tool_call bash({"command":"cargo test"})]"#,
+            )
+            .unwrap();
+        store
+            .append_message(
+                &ChatRole::Assistant,
+                r#"[tool_call final_answer({"answer":"修正したよ"})]"#,
+            )
+            .unwrap();
+        store
+            .append_ui_message("assistant", "修正したよ", 1)
+            .unwrap();
+
+        let transcript = load_session_transcript_in(dir.path(), "ui-session").unwrap();
+        assert_eq!(
+            transcript,
+            vec![
+                TranscriptMessage {
+                    role: "user".into(),
+                    content: "直して".into(),
+                },
+                TranscriptMessage {
+                    role: "assistant".into(),
+                    content: "修正したよ".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn transcript_recovers_protocol_v1_first_user_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = HistoryStore::open_in(dir.path(), "legacy-session").unwrap();
+        store
+            .append_message(
+                &ChatRole::User,
+                "キャラ設定\n\nデフォルトでは日本語で回答してください。ユーザーが他の言語で書いた場合は、その言語で回答してください。\n\n本題です",
+            )
+            .unwrap();
+        let transcript = load_session_transcript_in(dir.path(), "legacy-session").unwrap();
+        assert_eq!(transcript[0].content, "本題です");
+    }
+
+    #[test]
+    fn session_metadata_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = HistoryStore::open_in(dir.path(), "meta-session").unwrap();
+        store
+            .write_header(
+                "gemma",
+                "kotonia",
+                "allowlist",
+                Path::new("/tmp/kotonia-agent-abcd"),
+                false,
+            )
+            .unwrap();
+        let meta = load_session_metadata_in(dir.path(), "meta-session").unwrap();
+        assert_eq!(meta.id, "meta-session");
+        assert_eq!(meta.workspace, PathBuf::from("/tmp/kotonia-agent-abcd"));
+        assert!(!meta.in_place);
     }
 }
