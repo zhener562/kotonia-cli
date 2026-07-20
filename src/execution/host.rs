@@ -36,6 +36,102 @@ impl std::fmt::Display for HostExecutorError {
 
 impl std::error::Error for HostExecutorError {}
 
+/// Program used for `bash -c`. On unix this is simply `bash` from PATH.
+#[cfg(not(windows))]
+fn bash_program() -> Result<PathBuf, HostExecutorError> {
+    Ok(PathBuf::from("bash"))
+}
+
+/// On Windows, plain `Command::new("bash")` is a trap: PATH usually resolves
+/// to `C:\Windows\System32\bash.exe`, the WSL launcher, so agent commands
+/// would silently run inside a Linux distro (different filesystem view, none
+/// of the env vars set below propagate without WSLENV) — or fail outright
+/// when WSL has no distro installed. Resolve a win32 bash (Git Bash / MSYS2)
+/// instead, skipping the WSL launcher explicitly.
+#[cfg(windows)]
+fn bash_program() -> Result<PathBuf, HostExecutorError> {
+    static BASH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    BASH.get_or_init(find_win32_bash).clone().ok_or_else(|| {
+        HostExecutorError::Spawn(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no win32 bash.exe found (System32's bash.exe is the WSL launcher and is \
+             skipped on purpose). Install Git for Windows (https://gitforwindows.org) \
+             or point KOTONIA_BASH at a bash.exe",
+        ))
+    })
+}
+
+#[cfg(windows)]
+fn find_win32_bash() -> Option<PathBuf> {
+    // Explicit override first — also the escape hatch for whoever really
+    // does want the WSL launcher.
+    if let Some(p) = std::env::var_os("KOTONIA_BASH") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let path_var = std::env::var_os("PATH")?;
+    // A bash.exe already on PATH (Git\bin or MSYS2 setups), minus the WSL
+    // launcher (System32) and the Microsoft Store alias stub (WindowsApps).
+    for dir in std::env::split_paths(&path_var) {
+        let cand = dir.join("bash.exe");
+        if cand.is_file() && !is_windows_bash_launcher_dir(&dir) {
+            return Some(cand);
+        }
+    }
+    // Derive from git.exe on PATH: <root>\cmd\git.exe → <root>\bin\bash.exe.
+    for dir in std::env::split_paths(&path_var) {
+        if !dir.join("git.exe").is_file() {
+            continue;
+        }
+        if let Some(root) = dir.parent() {
+            for rel in [
+                ["bin", "bash.exe"].as_slice(),
+                ["usr", "bin", "bash.exe"].as_slice(),
+            ] {
+                let cand = rel.iter().fold(root.to_path_buf(), |p, s| p.join(s));
+                if cand.is_file() {
+                    return Some(cand);
+                }
+            }
+        }
+    }
+    // Standard Git for Windows install locations, for PATH-less setups.
+    let roots = [
+        std::env::var_os("ProgramFiles").map(|v| PathBuf::from(v).join("Git")),
+        std::env::var_os("ProgramFiles(x86)").map(|v| PathBuf::from(v).join("Git")),
+        std::env::var_os("LOCALAPPDATA").map(|v| PathBuf::from(v).join("Programs").join("Git")),
+    ];
+    for root in roots.into_iter().flatten() {
+        let cand = root.join("bin").join("bash.exe");
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
+}
+
+/// `System32` hosts the WSL launcher; `WindowsApps` hosts the Store's
+/// app-execution-alias stubs. Neither is a bash that runs win32-side.
+#[cfg(windows)]
+fn is_windows_bash_launcher_dir(dir: &Path) -> bool {
+    let lower = dir.to_string_lossy().replace('/', "\\").to_lowercase();
+    lower.contains("\\system32") || lower.contains("\\windowsapps")
+}
+
+/// The desktop app is a GUI-subsystem process; without CREATE_NO_WINDOW a
+/// console-subsystem child (bash.exe) gets a fresh visible console window
+/// flashing up for every agent command.
+#[cfg(windows)]
+fn suppress_console_window(cmd: &mut Command) {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn suppress_console_window(_cmd: &mut Command) {}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ExecutionResult {
     pub exit_code: i32,
@@ -90,7 +186,7 @@ impl HostExecutor {
     /// so it can use pipes, redirections, and shell built-ins without
     /// worrying about which command runner is in front.
     pub async fn bash(&self, command: &str) -> Result<ExecutionResult, HostExecutorError> {
-        let mut cmd = Command::new("bash");
+        let mut cmd = Command::new(bash_program()?);
         cmd.arg("-c")
             .arg(command)
             .current_dir(&self.cwd)
@@ -112,6 +208,7 @@ impl HostExecutor {
             .env("PAGER", "cat")
             .env("DEBIAN_FRONTEND", "noninteractive");
         detach_controlling_terminal(&mut cmd);
+        suppress_console_window(&mut cmd);
         let mut child = cmd.spawn().map_err(HostExecutorError::Spawn)?;
 
         let stdout = child.stdout.take().expect("piped stdout");
