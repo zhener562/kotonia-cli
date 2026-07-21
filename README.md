@@ -15,7 +15,7 @@ A local shell agent driven by hosted or self-hosted LLMs. Two engines:
 ```
 ─────────────────────────────────────────────
 kotonia-cli
-  model     : kotonia-gemma4-26b (kotonia)
+  model     : kotonia-llm-basic (kotonia)
   tools     : native (bash + web_search + fetch_url)
   approval  : allowlist
   workspace : /tmp/kotonia-agent-xyz  (worktree)
@@ -125,7 +125,7 @@ Built-in providers:
 
 | `--provider` | Endpoint                       | Default model         | Auth                              |
 | ------------ | ------------------------------ | --------------------- | --------------------------------- |
-| `kotonia`    | kotonia.ai `/api/v1`           | `kotonia-gemma4-26b`  | `KOTONIA_API_KEY` or `daemon.json` device_token |
+| `kotonia`    | kotonia.ai `/api/v1`           | `kotonia-llm-basic`  | `KOTONIA_API_KEY` or `daemon.json` device_token |
 | `deepseek`   | api.deepseek.com               | `deepseek-chat`       | `DEEPSEEK_API_KEY`                |
 
 DeepSeek's `:thinking` suffix on `deepseek-chat:thinking` /
@@ -167,7 +167,7 @@ The `models` array lets you skip `--provider` for those ids
 ## Usage
 
 ```sh
-# One-shot ReAct (defaults to kotonia-gemma4-26b)
+# One-shot ReAct (defaults to kotonia-llm-basic)
 kotonia-cli "explain the http error handling in src/router.rs"
 
 # Interactive REPL

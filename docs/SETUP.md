@@ -50,7 +50,7 @@ cargo run -- "your task here"
 | 経路 | `--model` | 推論場所 | GPU | 鍵 | tool calling |
 |---|---|---|---|---|---|
 | **A. DeepSeek API** | `deepseek-chat` / `deepseek-reasoner` | DeepSeek社 | 不要 | `DEEPSEEK_API_KEY` | native |
-| **B. kotonia ホスト** | `kotonia-gemma4-26b` / `kotonia-v4-flash` | あなたの kotonia.ai | 不要(ユーザー側) | `KOTONIA_API_KEY` | native / delimiter |
+| **B. kotonia ホスト** | `kotonia-llm-basic`(無料) / `kotonia-llm-standard`(従量) | あなたの kotonia.ai | 不要(ユーザー側) | `KOTONIA_API_KEY` | native |
 | **C. 完全ローカル** | `gemma4-26b-uncensored` / `deepseek-v4-flash` | 自分のGPU | **必須** | 不要 | native / delimiter |
 
 **最短で動かしたいなら A**。**プライバシー/無料が目的なら C**（ただしGPUとサーバ構築が要る）。
@@ -81,11 +81,11 @@ export KOTONIA_API_KEY=...            # kotonia.ai/api-manager で発行
 # 自前サーバが別URLなら:
 export KOTONIA_API_BASE=https://kotonia.ai   # 既定値。SSH先やlocalhostに向けるとき上書き
 
-kotonia-cli --model kotonia-gemma4-26b "summarise the README"
+kotonia-cli --model kotonia-llm-basic "summarise the README"
 ```
 
-- `kotonia-gemma4-26b` = native tools で安定（推奨）。
-- `kotonia-v4-flash` = 256K の超ロングコンテキストだが delimiter で不安定・低速。長文読解専用枠。
+- `kotonia-llm-basic`（= `kotonia-llm`）= 無料のローカルモデル、native tools（既定・推奨）。reasoning を効かせたいときは `kotonia-llm-basic:think`。
+- `kotonia-llm-standard` = クラウド級の上位ティア。実トークン量に応じてプリペイド残高から従量課金。難タスク向け。
 
 ---
 

@@ -246,7 +246,7 @@ impl Agent {
         self.provider.backend_label()
     }
 
-    /// Public model id of the active backend (e.g. `kotonia-gemma4-26b`,
+    /// Public model id of the active backend (e.g. `kotonia-llm-basic`,
     /// `deepseek-chat:thinking`). For history headers / observability.
     pub fn model_id(&self) -> &str {
         self.provider.model_id()

@@ -145,7 +145,7 @@ function startEngine(resumeSessionId?: string): void {
   }
   const cfg = vscode.workspace.getConfiguration("kotonia");
   const binary = resolveBinary(cfg.get<string>("enginePath", "kotonia-cli"), folder);
-  const model = cfg.get<string>("model", "kotonia-gemma4-26b");
+  const model = cfg.get<string>("model", "kotonia-llm-basic");
 
   void gatherEnv().then((env) => {
     if (model.startsWith("kotonia") && !env.KOTONIA_API_KEY && !process.env.KOTONIA_API_KEY) {

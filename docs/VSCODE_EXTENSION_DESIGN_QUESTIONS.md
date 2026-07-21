@@ -17,7 +17,7 @@
 
 1. **#18 engine 実行環境 = Linux 側（WSL / Remote-SSH）**。Windows native engine は追わない。
 2. **#13 worktree デフォルト + 差分ビュー + Merge ボタン**（in_place は設定で切替可）。
-3. **#16 既定モデル = `kotonia-gemma4-26b`（hosted・GPU不要）、キーは SecretStorage → spawn 時 env 注入**。
+3. **#16 既定モデル = `kotonia-llm-basic`（hosted・GPU不要）、キーは SecretStorage → spawn 時 env 注入**。
 
 この3つの帰結として A グループ（プロトコル封筒）は下記のとおり確定。
 
@@ -98,7 +98,7 @@
 ## E. モデル・APIキー・実行環境
 
 ### 16. キー注入 ★確定
-- → 回答: 既定モデル **`kotonia-gemma4-26b`**（hosted・native tools・GPU不要・鍵だけ）。キーは **VS Code SecretStorage**（`KOTONIA_API_KEY` / `DEEPSEEK_API_KEY`）に保存し、**spawn 時に子プロセス env へ注入**。`KOTONIA_API_BASE` は通常設定（既定 `https://kotonia.ai`）。`XAI_API_KEY` 等の暗黙フォールバックがあれば UI で明示表示。
+- → 回答: 既定モデル **`kotonia-llm-basic`**（hosted・native tools・GPU不要・鍵だけ）。キーは **VS Code SecretStorage**（`KOTONIA_API_KEY` / `DEEPSEEK_API_KEY`）に保存し、**spawn 時に子プロセス env へ注入**。`KOTONIA_API_BASE` は通常設定（既定 `https://kotonia.ai`）。`XAI_API_KEY` 等の暗黙フォールバックがあれば UI で明示表示。
 
 ### 17. モデル切替＝engine 再起動
 - → 回答: **セッション開始時に model 確定。切替 = engine プロセス再起動**（Provider は Agent 構築時固定のため）。UI のモデル選択は次ターンから新プロセスで反映。

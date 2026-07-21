@@ -1,7 +1,8 @@
 //! kotonia-cli — local shell agent backed by a hosted or self-hosted LLM.
 //!
 //! Built-in providers (resolved by model id):
-//!   - `kotonia-gemma4-26b` (default) — kotonia.ai /api/v1 chat (native tools)
+//!   - `kotonia-llm-basic` (default)  — kotonia.ai /api/v1 chat (free local, native tools)
+//!   - `kotonia-llm-standard`         — kotonia.ai /api/v1 chat (metered cloud tier)
 //!   - `deepseek-chat`                — DeepSeek API (native tools)
 //!   - `deepseek-reasoner`            — DeepSeek API (reasoning, native tools)
 //!
@@ -140,7 +141,7 @@ struct DaemonArgs {
 
     /// Model id for every task this daemon runs. Same surface as the
     /// one-shot CLI's `--model`. Default matches the one-shot default.
-    #[arg(long, default_value = "kotonia-gemma4-26b")]
+    #[arg(long, default_value = "kotonia-llm-basic")]
     model: String,
 
     /// Explicit provider name (`kotonia`, `deepseek`, or any entry from
@@ -177,12 +178,13 @@ struct RunArgs {
     /// One-shot task description. Omit to enter the interactive REPL.
     prompt: Option<String>,
 
-    /// Model id. Defaults to the hosted `kotonia-gemma4-26b` (requires
-    /// `kotonia-cli login`). DeepSeek API: `deepseek-chat`,
-    /// `deepseek-reasoner` (with optional `:thinking` suffix, needs
-    /// `DEEPSEEK_API_KEY`). Custom providers come from
-    /// `~/.kotonia/providers.json` and are selected via `--provider`.
-    #[arg(short, long, default_value = "kotonia-gemma4-26b")]
+    /// Model id. Defaults to the hosted `kotonia-llm-basic` (free local;
+    /// requires `kotonia-cli login`). `kotonia-llm-standard` is the metered
+    /// cloud tier; append `:think` to `kotonia-llm-basic` for the reasoning
+    /// pass. DeepSeek API: `deepseek-chat`, `deepseek-reasoner` (optional
+    /// `:thinking` suffix, needs `DEEPSEEK_API_KEY`). Custom providers come
+    /// from `~/.kotonia/providers.json` and are selected via `--provider`.
+    #[arg(short, long, default_value = "kotonia-llm-basic")]
     model: String,
 
     /// Explicit provider name (`kotonia`, `deepseek`, or any entry from

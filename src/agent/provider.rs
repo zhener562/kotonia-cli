@@ -299,9 +299,9 @@ mod tests {
     fn for_model_resolves_kotonia_builtin() {
         // Doesn't require KOTONIA_API_KEY at construction — we only validate
         // a key exists when a request actually runs.
-        let p = Provider::for_model("kotonia-gemma4-26b").unwrap();
+        let p = Provider::for_model("kotonia-llm-basic").unwrap();
         assert_eq!(p.provider_name(), "kotonia");
-        assert_eq!(p.model_id(), "kotonia-gemma4-26b");
+        assert_eq!(p.model_id(), "kotonia-llm-basic");
     }
 
     #[test]
@@ -320,7 +320,7 @@ mod tests {
 
     #[test]
     fn supports_native_tools_uniformly() {
-        let p = Provider::for_model("kotonia-gemma4-26b").unwrap();
+        let p = Provider::for_model("kotonia-llm-basic").unwrap();
         assert!(p.supports_native_tools());
     }
 

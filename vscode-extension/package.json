@@ -162,8 +162,8 @@
         },
         "kotonia.model": {
           "type": "string",
-          "default": "kotonia-gemma4-26b",
-          "markdownDescription": "Model id passed to the engine. Hosted via kotonia.ai (needs `KOTONIA_API_KEY`): `kotonia-gemma4-26b`, `kotonia-thinkcap-27b` (append `:nothink` to skip the reasoning pass). DeepSeek API (needs `DEEPSEEK_API_KEY`): `deepseek-chat`, `deepseek-reasoner`. Custom endpoints can be added via `~/.kotonia/providers.json`."
+          "default": "kotonia-llm-basic",
+          "markdownDescription": "Model id passed to the engine. Hosted via kotonia.ai (needs `KOTONIA_API_KEY`): `kotonia-llm-basic` (free local; append `:think` for the reasoning pass), `kotonia-llm-standard` (metered cloud tier). DeepSeek API (needs `DEEPSEEK_API_KEY`): `deepseek-chat`, `deepseek-reasoner`. Custom endpoints can be added via `~/.kotonia/providers.json`."
         },
         "kotonia.approvalMode": {
           "type": "string",

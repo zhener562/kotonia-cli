@@ -3,7 +3,7 @@
   // vscode-extension/). The repo root is the agent's workspace, so the debug
   // engine binary resolves relative to it.
   "kotonia.enginePath": "${workspaceFolder}/target/debug/kotonia-cli",
-  "kotonia.model": "kotonia-gemma4-26b",
+  "kotonia.model": "kotonia-llm-basic",
   // in-place for the first test so the agent's edits show live in the editor.
   // Switch to "worktree" for isolated (review-before-merge) runs.
   "kotonia.workspaceMode": "in-place",

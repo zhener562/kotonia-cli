@@ -9,7 +9,7 @@
 //! Resolution:
 //!   1. `--provider <name>` if given → use that spec
 //!   2. else look up the requested model id in `model_index` to pick a
-//!      built-in provider (`kotonia-gemma4-26b` → `kotonia`,
+//!      built-in provider (`kotonia-llm-basic` → `kotonia`,
 //!      `deepseek-*` → `deepseek`, `providers.json::models[]` → that one)
 //!   3. else error with a hint
 //!
@@ -32,12 +32,14 @@ pub enum ProviderHook {
     /// `reasoning_effort` accordingly. `deepseek-reasoner` defaults to
     /// thinking; `deepseek-chat` defaults to non-thinking.
     DeepSeekThinking,
-    /// Kotonia-hosted models. `kotonia-thinkcap-27b` gets the base model's
-    /// official sampling (temp 1.0 / top_p 0.95 / top_k 20) and a
+    /// Kotonia-hosted models. `kotonia-llm-basic` (== `kotonia-llm`) is the
+    /// local model; it gets the base model's official sampling
+    /// (temp 1.0 / top_p 0.95 / top_k 20). Default is no-think (fast); the
+    /// `:think` suffix opts into the reasoning pass, which also sets a
     /// `max_tokens` floor of 8192 — the model card requires ≥4096
-    /// (preferably 8192+) or the reasoning budget truncates to blank
-    /// output. The `:nothink` suffix disables thinking via
-    /// `chat_template_kwargs` for latency-sensitive callers.
+    /// (preferably 8192+) or the reasoning budget truncates to blank output.
+    /// `kotonia-llm-standard` is DeepSeek-backed server-side and takes no
+    /// local shaping.
     Kotonia,
 }
 
@@ -69,17 +71,27 @@ impl ProviderSpec {
         let canonical = match self.hook {
             ProviderHook::None => requested_model.to_string(),
             ProviderHook::Kotonia => {
-                let (canon, thinking) = match requested_model.strip_suffix(":nothink") {
-                    Some(stripped) => (stripped.to_string(), false),
-                    None => (requested_model.to_string(), true),
+                // Default no-think (fast); `:think` opts into the reasoning
+                // pass. `:nothink` is still accepted as an explicit no-think
+                // for callers migrating off the old suffix.
+                let (canon, thinking) = match requested_model.strip_suffix(":think") {
+                    Some(stripped) => (stripped.to_string(), true),
+                    None => (
+                        requested_model
+                            .strip_suffix(":nothink")
+                            .unwrap_or(requested_model)
+                            .to_string(),
+                        false,
+                    ),
                 };
-                if canon == "kotonia-thinkcap-27b" {
+                // `kotonia-llm-basic` (and its bare alias `kotonia-llm`) is the
+                // local ThinkCap model. `kotonia-llm-standard` is DeepSeek-
+                // backed server-side and takes no local shaping.
+                let is_basic = matches!(canon.as_str(), "kotonia-llm" | "kotonia-llm-basic");
+                if is_basic {
                     extra_body.insert("temperature".into(), json!(1.0));
                     extra_body.insert("top_p".into(), json!(0.95));
                     extra_body.insert("top_k".into(), json!(20));
-                    // The server's chat template defaults to NO-think so
-                    // legacy voice callers stay fast — thinking is opt-in
-                    // and must be requested explicitly here.
                     if thinking {
                         extra_body.insert("max_tokens".into(), json!(8192));
                         extra_body.insert(
@@ -139,11 +151,7 @@ impl ProviderRegistry {
 
         // ── Built-in: kotonia (hosted /api/v1) ─────────────────────────────
         let kotonia = kotonia_builtin();
-        for m in [
-            "kotonia-gemma4-26b",
-            "kotonia-thinkcap-27b",
-            "kotonia-thinkcap-27b:nothink",
-        ] {
+        for m in ["kotonia-llm", "kotonia-llm-basic", "kotonia-llm-standard"] {
             model_index.insert(m.into(), kotonia.name.clone());
         }
         specs.insert(kotonia.name.clone(), kotonia);
@@ -240,7 +248,7 @@ fn kotonia_builtin() -> ProviderSpec {
         name: "kotonia".into(),
         base_url,
         api_key,
-        default_model: "kotonia-thinkcap-27b".into(),
+        default_model: "kotonia-llm-basic".into(),
         max_tokens_param: MaxTokensParam::MaxTokens,
         max_tokens_cap: None,
         extra_headers: Vec::new(),
@@ -347,25 +355,25 @@ mod tests {
     }
 
     #[test]
-    fn kotonia_passes_model_through() {
+    fn kotonia_standard_passes_through_unshaped() {
+        // `kotonia-llm-standard` is DeepSeek-backed server-side; the client
+        // sends it as-is with no local shaping.
         let spec = kotonia_builtin();
-        let r = spec.resolve_request("kotonia-gemma4-26b");
-        assert_eq!(r.canonical_model, "kotonia-gemma4-26b");
+        let r = spec.resolve_request("kotonia-llm-standard");
+        assert_eq!(r.canonical_model, "kotonia-llm-standard");
         assert!(r.extra_body.is_empty());
     }
 
     #[test]
-    fn thinkcap_gets_official_sampling_and_token_floor() {
+    fn basic_think_suffix_gets_sampling_and_token_floor() {
         let spec = kotonia_builtin();
-        let r = spec.resolve_request("kotonia-thinkcap-27b");
-        assert_eq!(r.canonical_model, "kotonia-thinkcap-27b");
+        let r = spec.resolve_request("kotonia-llm-basic:think");
+        assert_eq!(r.canonical_model, "kotonia-llm-basic");
         assert_eq!(r.extra_body["temperature"], json!(1.0));
         assert_eq!(r.extra_body["top_p"], json!(0.95));
         assert_eq!(r.extra_body["top_k"], json!(20));
-        // Thinking mode: model card requires >=4096 (preferably 8192+) or
-        // the reasoning budget truncates to blank output. The server
-        // template defaults to no-think, so thinking is requested
-        // explicitly.
+        // Thinking needs >=4096 (preferably 8192+) headroom or the reasoning
+        // budget truncates to blank output.
         assert_eq!(r.extra_body["max_tokens"], json!(8192));
         assert_eq!(
             r.extra_body["chat_template_kwargs"],
@@ -374,21 +382,25 @@ mod tests {
     }
 
     #[test]
-    fn thinkcap_nothink_suffix_disables_thinking() {
+    fn basic_defaults_to_no_think() {
         let spec = kotonia_builtin();
-        let r = spec.resolve_request("kotonia-thinkcap-27b:nothink");
-        assert_eq!(r.canonical_model, "kotonia-thinkcap-27b");
-        assert_eq!(
-            r.extra_body["chat_template_kwargs"],
-            json!({"enable_thinking": false})
-        );
-        assert!(!r.extra_body.contains_key("max_tokens"));
+        // Bare basic and the `kotonia-llm` alias default to no-think, and the
+        // explicit `:nothink` suffix is still honoured — none set a token floor.
+        for id in ["kotonia-llm-basic", "kotonia-llm", "kotonia-llm-basic:nothink"] {
+            let r = spec.resolve_request(id);
+            assert_eq!(
+                r.extra_body["chat_template_kwargs"],
+                json!({"enable_thinking": false}),
+                "{id}"
+            );
+            assert!(!r.extra_body.contains_key("max_tokens"), "{id}");
+        }
     }
 
     #[test]
-    fn thinkcap_models_route_to_kotonia_provider() {
+    fn kotonia_llm_models_route_to_kotonia_provider() {
         let reg = ProviderRegistry::load().unwrap();
-        for m in ["kotonia-thinkcap-27b", "kotonia-thinkcap-27b:nothink"] {
+        for m in ["kotonia-llm", "kotonia-llm-basic", "kotonia-llm-standard"] {
             let (spec, _) = reg.resolve(None, m).unwrap();
             assert_eq!(spec.name, "kotonia");
         }
@@ -397,7 +409,7 @@ mod tests {
     #[test]
     fn registry_infers_provider_from_model() {
         let reg = ProviderRegistry::load().unwrap();
-        let (spec, _) = reg.resolve(None, "kotonia-gemma4-26b").unwrap();
+        let (spec, _) = reg.resolve(None, "kotonia-llm-basic").unwrap();
         assert_eq!(spec.name, "kotonia");
         let (spec, _) = reg.resolve(None, "deepseek-chat").unwrap();
         assert_eq!(spec.name, "deepseek");
