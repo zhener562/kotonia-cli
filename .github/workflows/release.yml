@@ -24,6 +24,26 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+  # The main suite assumes a unix host (bash on PATH, /tmp, /dev/tty), so it
+  # only runs on ubuntu. This job runs just the #[cfg(windows)] host tests to
+  # prove the win32 bash resolver picks a real Git Bash (not the System32 WSL
+  # launcher) and runs win32-side. Git for Windows is preinstalled on the
+  # windows runner.
+  test-windows:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test (win32 bash resolver)
+        run: cargo test --locked win32_bash
+
   build:
     needs: test
     runs-on: ${{ matrix.os }}
