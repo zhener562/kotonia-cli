@@ -445,4 +445,56 @@ mod tests {
             "git commit without -m hung waiting for an editor"
         );
     }
+
+    // Windows-only: the whole point of the win32 bash resolver is to run
+    // commands through a real Git Bash / MSYS2 bash rather than System32's
+    // WSL launcher. These prove the resolver picks a real bash and that it
+    // actually executes win32-side (a /c/... MSYS path, never /mnt/c WSL).
+    #[cfg(windows)]
+    #[test]
+    fn win32_bash_launcher_dir_classification() {
+        assert!(is_windows_bash_launcher_dir(Path::new(
+            r"C:\Windows\System32"
+        )));
+        assert!(is_windows_bash_launcher_dir(Path::new(
+            r"C:\Users\x\AppData\Local\Microsoft\WindowsApps"
+        )));
+        assert!(!is_windows_bash_launcher_dir(Path::new(
+            r"C:\Program Files\Git\bin"
+        )));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn win32_bash_resolves_and_is_not_wsl_launcher() {
+        // GitHub's windows runners (and any Git-for-Windows host) ship a real
+        // bash, so resolution must succeed and must not be the WSL launcher.
+        let bash = bash_program().expect("win32 bash should resolve on a Git-for-Windows host");
+        assert!(
+            bash.is_file(),
+            "resolved bash must exist: {}",
+            bash.display()
+        );
+        assert!(
+            !is_windows_bash_launcher_dir(bash.parent().unwrap()),
+            "resolver must skip the WSL launcher, got: {}",
+            bash.display()
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn win32_bash_runs_win_side_not_wsl() {
+        // End-to-end through the resolved bash: given a Windows cwd, `pwd`
+        // reports a win32 MSYS path (`/c/...`). WSL's launcher would report
+        // a `/mnt/c/...` path — its absence proves we're not on WSL.
+        let exec = HostExecutor::new(std::env::temp_dir());
+        let r = exec.bash("pwd").await.unwrap();
+        assert_eq!(r.exit_code, 0, "bash did not run cleanly: {}", r.combined);
+        assert!(
+            !r.combined.contains("/mnt/"),
+            "resolved bash ran under WSL, not win32: {}",
+            r.combined
+        );
+    }
 }
