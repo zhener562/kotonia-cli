@@ -28,6 +28,7 @@ use crate::ai::{AiCallOptions, AiContent, AiMessage, AiRole, AiStopReason, AiToo
 use crate::execution::host::{ExecutionResult, HostExecutor};
 
 use super::approval::{decide, ApprovalMode, Decision};
+use super::compaction;
 use super::history::HistoryStore;
 use super::parse::{parse, Action};
 use super::prompt::{system_prompt, system_prompt_native};
@@ -173,6 +174,11 @@ pub struct Agent {
     /// flip this off for the rest of the session and fall back to `auto`.
     tool_choice_required: bool,
     history: Option<HistoryStore>,
+    /// Index of the current turn's task message in `native_messages` /
+    /// `messages`. Compaction stubs outputs only before it: within the turn
+    /// the model may still need them (see `compaction`).
+    turn_start_native: usize,
+    turn_start_chat: usize,
     /// Coarse cancellation flag. Checked at each iteration boundary so a
     /// frontend can stop a runaway turn between tool calls (in-flight bash /
     /// LLM calls still complete first — that's the "coarse" tradeoff). Reset
@@ -214,6 +220,8 @@ impl Agent {
             pending_user_followups: Vec::new(),
             tool_choice_required: native_mode,
             history: None,
+            turn_start_native: 0,
+            turn_start_chat: 0,
             cancel: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -347,6 +355,7 @@ impl Agent {
     ) -> Result<String, AgentError> {
         self.history_turn_start();
         self.cancel.store(false, Ordering::SeqCst);
+        self.turn_start_chat = self.messages.len();
         self.push_logged(ChatMsg::user(task.to_string()));
 
         for iter in 1..=self.config.max_iterations {
@@ -359,6 +368,7 @@ impl Agent {
             });
 
             sink.emit(Event::LlmThinking);
+            self.compact_if_needed().await;
             let assistant_text = match self
                 .provider
                 .complete(self.messages.clone(), self.config.max_tokens)
@@ -485,6 +495,7 @@ impl Agent {
         self.history_turn_start();
         self.cancel.store(false, Ordering::SeqCst);
         self.hydrate_native_from_messages();
+        self.turn_start_native = self.native_messages.len();
         self.native_messages
             .push(AiMessage::user_text(task.to_string()));
         // Keep the on-disk transcript readable for resume: every native
@@ -504,6 +515,7 @@ impl Agent {
                 max: self.config.max_iterations,
             });
             sink.emit(Event::LlmThinking);
+            self.compact_if_needed().await;
 
             let response = match self.complete_native().await {
                 Ok(r) => r,
@@ -670,6 +682,138 @@ impl Agent {
         });
         self.history_turn_end(self.config.max_iterations, false);
         Err(AgentError::IterationLimit(self.config.max_iterations))
+    }
+
+    /// Keep what the next call sends inside the model's window (see
+    /// `compaction`). Rewrites only the in-memory conversation: the
+    /// session log on disk keeps everything, and a resumed session is
+    /// compacted again on its first call.
+    async fn compact_if_needed(&mut self) {
+        let budget =
+            compaction::Budget::for_model(self.provider.model_id(), self.config.max_tokens);
+        let fixed = if self.native_mode {
+            compaction::estimate_text(&self.system_prompt)
+                + compaction::estimate_text(
+                    &serde_json::to_string(&self.tool_catalog).unwrap_or_default(),
+                )
+        } else {
+            0
+        };
+        let estimate = |this: &Self| {
+            fixed
+                + if this.native_mode {
+                    compaction::estimate_native(&this.native_messages)
+                } else {
+                    compaction::estimate_chat(&this.messages)
+                }
+        };
+        let before = estimate(self);
+        if before <= budget.trigger_tokens {
+            return;
+        }
+
+        let stubbed = if self.native_mode {
+            compaction::stub_old_results_native(
+                &mut self.native_messages,
+                self.turn_start_native,
+                fixed,
+                budget.target_tokens,
+            )
+        } else {
+            compaction::stub_old_results_chat(
+                &mut self.messages,
+                self.turn_start_chat,
+                budget.target_tokens,
+            )
+        };
+        let after_stub = estimate(self);
+        let mut summarised = 0;
+        if after_stub > budget.target_tokens {
+            let summary_tokens = self.config.max_tokens.max(2_048);
+            let keep = budget
+                .target_tokens
+                .saturating_sub(fixed + compaction::SUMMARY_RESERVE_TOKENS);
+            let cut = if self.native_mode {
+                compaction::cut_native(&self.native_messages, keep)
+            } else {
+                compaction::cut_chat(&self.messages, keep)
+            };
+            if let Some(cut) = cut {
+                // The summariser gets at most what the target allows, so
+                // it fits the same window it is trying to relieve.
+                let max_bytes = budget.target_tokens * 3;
+                let transcript = if self.native_mode {
+                    compaction::render_native(&self.native_messages[..cut], max_bytes)
+                } else {
+                    compaction::render_chat(&self.messages[..cut], max_bytes)
+                };
+                let request = vec![
+                    ChatMsg::system(compaction::SUMMARY_SYSTEM),
+                    ChatMsg::user(transcript),
+                ];
+                let mut summary = Err(String::new());
+                for attempt in 1..=2 {
+                    summary = match self
+                        .provider
+                        .complete(request.clone(), summary_tokens)
+                        .await
+                    {
+                        Ok(s) if s.trim().is_empty() => Err("empty summary".to_string()),
+                        Ok(s) => Ok(s),
+                        Err(e) => Err(e.to_string()),
+                    };
+                    match &summary {
+                        Ok(_) => break,
+                        Err(e) => eprintln!(
+                            "kotonia-cli: summarising old context failed (attempt {attempt}: {e})"
+                        ),
+                    }
+                }
+                match summary {
+                    Ok(s) => {
+                        if std::env::var_os("KOTONIA_DEBUG_COMPACTION").is_some() {
+                            eprintln!("kotonia-cli: compaction notes:\n{s}");
+                        }
+                        let note = compaction::replacement_text(&s);
+                        if self.native_mode {
+                            self.turn_start_native = compaction::splice_native(
+                                &mut self.native_messages,
+                                cut,
+                                note,
+                                self.turn_start_native,
+                            );
+                        } else {
+                            self.turn_start_chat = compaction::splice_chat(
+                                &mut self.messages,
+                                cut,
+                                note,
+                                self.turn_start_chat,
+                            );
+                        }
+                    }
+                    // Keep the task and the reasoning; only outputs go.
+                    Err(_) => {
+                        if self.native_mode {
+                            compaction::stub_prefix_native(&mut self.native_messages, cut);
+                        } else {
+                            compaction::stub_prefix_chat(&mut self.messages, cut);
+                        }
+                    }
+                }
+                summarised = cut;
+            }
+        }
+        eprintln!(
+            "kotonia-cli: context ~{before} tokens over {} — stubbed {stubbed} old outputs \
+             (~{after_stub}){}; now ~{} tokens",
+            budget.trigger_tokens,
+            if summarised > 0 {
+                format!(", summarised {summarised} older messages")
+            } else {
+                String::new()
+            },
+            estimate(self)
+        );
     }
 
     /// One LLM call on the native path. Sends `tool_choice: "required"`

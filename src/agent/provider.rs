@@ -15,7 +15,7 @@ use crate::ai::openai_compat::{create_with_tools as oai_create_with_tools, OpenA
 use crate::ai::{AiCallOptions, AiContent, AiMessage, AiResponse, AiRole, AiStopReason, AiUsage};
 use crate::providers::{ProviderRegistry, ProviderSpec};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChatRole {
     System,
     User,
