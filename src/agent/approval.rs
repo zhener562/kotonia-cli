@@ -225,26 +225,95 @@ fn is_known_safe(segment: &str, leader: &str) -> bool {
     // Single-word builtins / read-only inspection / standard build & test commands.
     const SAFE_LEADERS: &[&str] = &[
         // file & dir inspection
-        "ls", "cat", "head", "tail", "wc", "stat", "file", "du", "df", "pwd", "tree", "echo",
-        "printf", "true", "false", "which", "type", "whoami", "hostname", "uname", "date", "env",
+        "ls",
+        "cat",
+        "head",
+        "tail",
+        "wc",
+        "stat",
+        "file",
+        "du",
+        "df",
+        "pwd",
+        "tree",
+        "echo",
+        "printf",
+        "true",
+        "false",
+        "which",
+        "type",
+        "whoami",
+        "hostname",
+        "uname",
+        "date",
+        "env",
         "id",
         // text processing
-        "grep", "egrep", "rg", "sed", "awk", "cut", "sort", "uniq", "tr", "diff", "patch",
-        "jq", "yq", "xxd", "hexdump", "base64", "md5sum", "sha256sum", "tee", "column",
+        "grep",
+        "egrep",
+        "rg",
+        "sed",
+        "awk",
+        "cut",
+        "sort",
+        "uniq",
+        "tr",
+        "diff",
+        "patch",
+        "jq",
+        "yq",
+        "xxd",
+        "hexdump",
+        "base64",
+        "md5sum",
+        "sha256sum",
+        "tee",
+        "column",
         // navigation / search
-        "find", "fd", "locate",
+        "find",
+        "fd",
+        "locate",
         // build & test (mutate target/, but inside worktree only)
-        "cargo", "rustc", "rustup",
-        "npm", "npx", "pnpm", "yarn", "node",
-        "python", "python3", "pip", "pip3", "uv", "ruff", "mypy", "pytest", "poetry",
-        "go", "make", "cmake", "ninja", "gcc", "g++", "clang", "clang++", "ld",
-        "ruby", "bundle", "rake",
+        "cargo",
+        "rustc",
+        "rustup",
+        "npm",
+        "npx",
+        "pnpm",
+        "yarn",
+        "node",
+        "python",
+        "python3",
+        "pip",
+        "pip3",
+        "uv",
+        "ruff",
+        "mypy",
+        "pytest",
+        "poetry",
+        "go",
+        "make",
+        "cmake",
+        "ninja",
+        "gcc",
+        "g++",
+        "clang",
+        "clang++",
+        "ld",
+        "ruby",
+        "bundle",
+        "rake",
         // language tools (often read-only / safe sub-actions)
-        "shuttle", "tsc", "next",
+        "shuttle",
+        "tsc",
+        "next",
         // git (sub-action vetted below)
         "git",
         // process/env inspection
-        "ps", "top", "free", "uptime",
+        "ps",
+        "top",
+        "free",
+        "uptime",
     ];
     if !SAFE_LEADERS.contains(&leader) {
         return false;
@@ -255,8 +324,7 @@ fn is_known_safe(segment: &str, leader: &str) -> bool {
     if leader == "find" {
         // Reject -delete and -exec ... rm style payloads.
         let lower = segment.to_ascii_lowercase();
-        if lower.contains(" -delete") || lower.contains(" -exec ") || lower.contains(" -execdir ")
-        {
+        if lower.contains(" -delete") || lower.contains(" -exec ") || lower.contains(" -execdir ") {
             return false;
         }
     }
@@ -332,7 +400,10 @@ mod tests {
     #[test]
     fn allowlist_passes_inspection() {
         assert_eq!(decide(ApprovalMode::Allowlist, "ls -la"), Decision::Allow);
-        assert_eq!(decide(ApprovalMode::Allowlist, "cat README.md"), Decision::Allow);
+        assert_eq!(
+            decide(ApprovalMode::Allowlist, "cat README.md"),
+            Decision::Allow
+        );
         assert_eq!(
             decide(ApprovalMode::Allowlist, "grep -rn 'foo' src/"),
             Decision::Allow
@@ -345,9 +416,18 @@ mod tests {
 
     #[test]
     fn allowlist_passes_git_read_and_local_writes() {
-        assert_eq!(decide(ApprovalMode::Allowlist, "git status"), Decision::Allow);
-        assert_eq!(decide(ApprovalMode::Allowlist, "git log -n 5"), Decision::Allow);
-        assert_eq!(decide(ApprovalMode::Allowlist, "git add -A"), Decision::Allow);
+        assert_eq!(
+            decide(ApprovalMode::Allowlist, "git status"),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide(ApprovalMode::Allowlist, "git log -n 5"),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide(ApprovalMode::Allowlist, "git add -A"),
+            Decision::Allow
+        );
         assert_eq!(
             decide(ApprovalMode::Allowlist, "git commit -m 'wip'"),
             Decision::Allow
@@ -357,8 +437,14 @@ mod tests {
     #[test]
     fn allowlist_blocks_force_push_and_hard_reset() {
         assert!(ask(decide(ApprovalMode::Allowlist, "git push --force")));
-        assert!(ask(decide(ApprovalMode::Allowlist, "git push -f origin main")));
-        assert!(ask(decide(ApprovalMode::Allowlist, "git reset --hard HEAD~3")));
+        assert!(ask(decide(
+            ApprovalMode::Allowlist,
+            "git push -f origin main"
+        )));
+        assert!(ask(decide(
+            ApprovalMode::Allowlist,
+            "git reset --hard HEAD~3"
+        )));
         assert!(ask(decide(ApprovalMode::Allowlist, "git clean -fdx")));
     }
 
@@ -382,14 +468,8 @@ mod tests {
             ApprovalMode::Allowlist,
             "ls && rm -rf /tmp/whatever"
         )));
-        assert!(ask(decide(
-            ApprovalMode::Allowlist,
-            "echo hi; sudo whoami"
-        )));
-        assert!(ask(decide(
-            ApprovalMode::Allowlist,
-            "cat README.md | bash"
-        )));
+        assert!(ask(decide(ApprovalMode::Allowlist, "echo hi; sudo whoami")));
+        assert!(ask(decide(ApprovalMode::Allowlist, "cat README.md | bash")));
     }
 
     #[test]
@@ -410,7 +490,10 @@ mod tests {
 
     #[test]
     fn allowlist_blocks_unknown_leader() {
-        assert!(ask(decide(ApprovalMode::Allowlist, "supersecret-installer")));
+        assert!(ask(decide(
+            ApprovalMode::Allowlist,
+            "supersecret-installer"
+        )));
     }
 
     #[test]

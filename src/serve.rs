@@ -198,9 +198,9 @@ impl EventSink for JsonSink {
         }
         // The Event derive already produces `{"type": "...", ...}`; splice in
         // the turn id so the frontend can group events per turn.
-        let mut v = serde_json::to_value(&event).unwrap_or_else(|e| {
-            json!({"type": "error", "message": format!("event serialize failed: {e}")})
-        });
+        let mut v = serde_json::to_value(&event).unwrap_or_else(
+            |e| json!({"type": "error", "message": format!("event serialize failed: {e}")}),
+        );
         if let Some(obj) = v.as_object_mut() {
             obj.insert("turn_id".to_string(), json!(self.turn_id));
         }

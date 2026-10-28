@@ -33,11 +33,9 @@ pub fn load() -> Option<DaemonStoredConfig> {
 pub fn save(cfg: &DaemonStoredConfig) -> Result<PathBuf, String> {
     let path = config_path().ok_or_else(|| "HOME is not set".to_string())?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("create {}: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
-    let json = serde_json::to_string_pretty(cfg)
-        .map_err(|e| format!("serialize config: {e}"))?;
+    let json = serde_json::to_string_pretty(cfg).map_err(|e| format!("serialize config: {e}"))?;
     std::fs::write(&path, json).map_err(|e| format!("write {}: {e}", path.display()))?;
     // Tighten perms: contains a long-lived bearer token. 0600 on unix.
     #[cfg(unix)]
@@ -128,7 +126,7 @@ pub fn load_providers() -> Result<Option<ProvidersFile>, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("read {}: {e}", path.display())),
     };
-    let parsed: ProvidersFile = serde_json::from_str(&raw)
-        .map_err(|e| format!("parse {}: {e}", path.display()))?;
+    let parsed: ProvidersFile =
+        serde_json::from_str(&raw).map_err(|e| format!("parse {}: {e}", path.display()))?;
     Ok(Some(parsed))
 }

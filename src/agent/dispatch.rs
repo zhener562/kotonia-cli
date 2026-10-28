@@ -5,9 +5,7 @@
 //! the two concrete agents in a small enum keeps both call sites
 //! straightforward — no `dyn AgentLike` dance, no async trait.
 
-use crate::agent::agent::{
-    Agent, AgentError, ApprovalHandler, Event, EventSink,
-};
+use crate::agent::agent::{Agent, AgentError, ApprovalHandler, Event, EventSink};
 use crate::agent::claude_code::{ClaudeCodeAgent, ClaudeCodeError};
 use crate::agent::history::HistoryStore;
 use crate::agent::provider::ChatMsg;

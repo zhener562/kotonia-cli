@@ -218,7 +218,10 @@ impl AiCallOptions {
 #[derive(Debug)]
 pub enum AiError {
     Http(String),
-    Api { status: Option<u16>, message: String },
+    Api {
+        status: Option<u16>,
+        message: String,
+    },
     Parse(String),
     Invalid(String),
 }

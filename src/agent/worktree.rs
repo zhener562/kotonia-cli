@@ -93,11 +93,7 @@ impl AgentWorkspace {
         };
 
         // Worktree path: /tmp/kotonia-agent-<8 char uuid>
-        let suffix: String = uuid::Uuid::new_v4()
-            .to_string()
-            .chars()
-            .take(8)
-            .collect();
+        let suffix: String = uuid::Uuid::new_v4().to_string().chars().take(8).collect();
         let wt_path = std::env::temp_dir().join(format!("kotonia-agent-{suffix}"));
         let branch = format!("kotonia-agent/{suffix}");
 
@@ -206,9 +202,9 @@ async fn run_git(exec: &HostExecutor, cmd: &str) -> Result<String, WorktreeError
 }
 
 fn shell_escape(s: &str) -> String {
-    if s.chars().all(|c| {
-        c.is_ascii_alphanumeric() || c == '/' || c == '.' || c == '_' || c == '-'
-    }) {
+    if s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '.' || c == '_' || c == '-')
+    {
         s.to_string()
     } else {
         let escaped = s.replace('\'', "'\\''");

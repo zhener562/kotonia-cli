@@ -53,10 +53,7 @@ pub async fn create_with_tools(
     messages: Vec<AiMessage>,
     options: AiCallOptions,
 ) -> Result<AiResponse, AiError> {
-    let url = format!(
-        "{}/chat/completions",
-        config.api_base.trim_end_matches('/')
-    );
+    let url = format!("{}/chat/completions", config.api_base.trim_end_matches('/'));
     let body = build_request_body(config.clone(), messages, options)?;
 
     let mut req = client
@@ -200,9 +197,7 @@ fn content_text_only(content: &[AiContent], role: &str) -> Result<String, AiErro
 fn user_message_to_wire(content: &[AiContent]) -> Result<Value, AiError> {
     // Fast path: if every block is text, keep the string-content shape
     // (smaller wire payload, max provider compatibility).
-    let has_non_text = content
-        .iter()
-        .any(|c| !matches!(c, AiContent::Text { .. }));
+    let has_non_text = content.iter().any(|c| !matches!(c, AiContent::Text { .. }));
     if !has_non_text {
         return Ok(json!({
             "role": "user",

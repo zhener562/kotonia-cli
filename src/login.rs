@@ -74,7 +74,9 @@ pub async fn poll_once(server: &str, device_code: &str) -> Result<PollOutcome, S
     let server = server.trim_end_matches('/');
     let http = http_client()?;
     let resp = http
-        .get(format!("{server}/api/agent-runtime/device-codes/{device_code}"))
+        .get(format!(
+            "{server}/api/agent-runtime/device-codes/{device_code}"
+        ))
         .send()
         .await
         .map_err(|e| format!("poll: {e}"))?;
@@ -92,7 +94,11 @@ pub async fn poll_once(server: &str, device_code: &str) -> Result<PollOutcome, S
 }
 
 /// Persist an approved device pairing to `~/.kotonia/daemon.json`.
-pub fn save_pairing(server: &str, device_id: String, device_token: String) -> Result<std::path::PathBuf, String> {
+pub fn save_pairing(
+    server: &str,
+    device_id: String,
+    device_token: String,
+) -> Result<std::path::PathBuf, String> {
     save_config(&DaemonStoredConfig {
         server: server.trim_end_matches('/').to_string(),
         device_id,

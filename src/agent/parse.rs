@@ -13,7 +13,9 @@ pub enum Action {
     Final(String),
     /// Model emitted neither a bash block nor a final answer. The caller
     /// should prod it to try again rather than silently looping.
-    Malformed { excerpt: String },
+    Malformed {
+        excerpt: String,
+    },
 }
 
 pub fn parse(response: &str) -> Action {
@@ -61,18 +63,47 @@ fn looks_like_action_intention(text: &str) -> bool {
     let head: String = text.chars().take(80).collect();
     let lower = head.to_ascii_lowercase();
     const EN_PHRASES: &[&str] = &[
-        "i'll ", "i will ", "i shall ", "let me ", "let's ", "let us ", "now i ",
-        "first, ", "first i ", "next, ", "i'm going to ", "i am going to ",
-        "i'd like to ", "i need to run ", "i should run ", "i'll execute ",
-        "i'll check ", "i'll look ", "i'll start ", "going to run ",
+        "i'll ",
+        "i will ",
+        "i shall ",
+        "let me ",
+        "let's ",
+        "let us ",
+        "now i ",
+        "first, ",
+        "first i ",
+        "next, ",
+        "i'm going to ",
+        "i am going to ",
+        "i'd like to ",
+        "i need to run ",
+        "i should run ",
+        "i'll execute ",
+        "i'll check ",
+        "i'll look ",
+        "i'll start ",
+        "going to run ",
     ];
     if EN_PHRASES.iter().any(|p| lower.starts_with(p)) {
         return true;
     }
     const JA_PREFIXES: &[&str] = &[
-        "次は", "次に", "じゃあ", "では", "それでは", "まず", "まずは",
-        "今から", "確認します", "実行します", "やってみます", "見てみます",
-        "やります", "実行してみます", "確認してみます", "ちょっと",
+        "次は",
+        "次に",
+        "じゃあ",
+        "では",
+        "それでは",
+        "まず",
+        "まずは",
+        "今から",
+        "確認します",
+        "実行します",
+        "やってみます",
+        "見てみます",
+        "やります",
+        "実行してみます",
+        "確認してみます",
+        "ちょっと",
     ];
     JA_PREFIXES.iter().any(|p| head.starts_with(p))
 }

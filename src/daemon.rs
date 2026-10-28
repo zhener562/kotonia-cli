@@ -30,9 +30,7 @@ use tokio_tungstenite::tungstenite::{
     Message as WsMessage,
 };
 
-use crate::agent::agent::{
-    Agent, AgentConfig, ApprovalHandler, ApprovalOutcome, Event, EventSink,
-};
+use crate::agent::agent::{Agent, AgentConfig, ApprovalHandler, ApprovalOutcome, Event, EventSink};
 use crate::agent::approval::ApprovalMode;
 use crate::agent::claude_code::ClaudeCodeAgent;
 use crate::agent::dispatch::DispatchAgent;
@@ -143,8 +141,7 @@ impl SessionRegistry {
         }
         let model = model_override.unwrap_or(&config.model);
         let use_claude_code = config.engine == "claude-code" || model == "claude-code";
-        let launch_cwd =
-            std::env::current_dir().map_err(|e| format!("read cwd: {e}"))?;
+        let launch_cwd = std::env::current_dir().map_err(|e| format!("read cwd: {e}"))?;
         let workspace = if config.in_place {
             AgentWorkspace::in_place(launch_cwd)
         } else {
@@ -153,8 +150,7 @@ impl SessionRegistry {
                 .map_err(|e| format!("worktree create: {e}"))?
         };
         let mut agent = if use_claude_code {
-            let cc_session_id =
-                crate::agent::claude_code::claude_code_session_id(session_id);
+            let cc_session_id = crate::agent::claude_code::claude_code_session_id(session_id);
             DispatchAgent::ClaudeCode(ClaudeCodeAgent::new(
                 &workspace.root,
                 cc_session_id,
@@ -197,7 +193,10 @@ impl SessionRegistry {
                 }
             }
             Err(e) => {
-                eprintln!("[daemon] session {} history disabled: {e}", short(session_id));
+                eprintln!(
+                    "[daemon] session {} history disabled: {e}",
+                    short(session_id)
+                );
             }
         }
 
@@ -215,7 +214,11 @@ impl SessionRegistry {
             return Ok(existing.clone());
         }
         map.insert(session_id.to_string(), state.clone());
-        eprintln!("[daemon] session {} opened (model={})", short(session_id), model);
+        eprintln!(
+            "[daemon] session {} opened (model={})",
+            short(session_id),
+            model
+        );
         Ok(state)
     }
 
@@ -417,7 +420,10 @@ async fn connect_and_pump(
         let text = match msg {
             WsMessage::Text(t) => t.to_string(),
             WsMessage::Close(_) => break,
-            WsMessage::Ping(_) | WsMessage::Pong(_) | WsMessage::Binary(_) | WsMessage::Frame(_) => {
+            WsMessage::Ping(_)
+            | WsMessage::Pong(_)
+            | WsMessage::Binary(_)
+            | WsMessage::Frame(_) => {
                 // tokio-tungstenite auto-replies to protocol-level Pings
                 // for us. The application-level keepalive uses
                 // ServerMsg::Ping / DeviceMsg::Pong over JSON frames
@@ -611,7 +617,11 @@ async fn run_agent_task(
         pending,
     };
 
-    if let Err(e) = state.agent.run_turn(&prompt, &mut approval, &mut sink).await {
+    if let Err(e) = state
+        .agent
+        .run_turn(&prompt, &mut approval, &mut sink)
+        .await
+    {
         emit_error(&out_tx, &task_id, format!("agent: {e}"));
     }
     state.last_active = Instant::now();
@@ -694,7 +704,9 @@ fn http_to_ws_url(server: &str, device_id: &str) -> Option<String> {
     } else {
         return None;
     };
-    Some(format!("{scheme}://{rest}/api/agent-runtime/ws/{device_id}"))
+    Some(format!(
+        "{scheme}://{rest}/api/agent-runtime/ws/{device_id}"
+    ))
 }
 
 #[cfg(test)]

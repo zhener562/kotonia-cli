@@ -43,8 +43,7 @@ pub fn claude_code_session_id(host_session_id: &str) -> String {
     if uuid::Uuid::parse_str(host_session_id).is_ok() {
         return host_session_id.to_string();
     }
-    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, host_session_id.as_bytes())
-        .to_string()
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, host_session_id.as_bytes()).to_string()
 }
 
 /// Where the `claude` binary lives. The PATH lookup happens lazily on
@@ -222,10 +221,7 @@ impl ClaudeCodeEngine {
                     for block in blocks {
                         match block.get("type").and_then(|v| v.as_str()) {
                             Some("text") => {
-                                let text = block
-                                    .get("text")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
+                                let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
                                 if !text.trim().is_empty() {
                                     if !had_text {
                                         sink.emit(Event::LlmThinking);
@@ -330,17 +326,12 @@ impl ClaudeCodeEngine {
                 }
                 // Quietly-ignored housekeeping events Claude Code emits.
                 // Surfacing these as "malformed" buries the real signal.
-                Some("rate_limit_event")
-                | Some("stream_event")
-                | Some("compact_boundary") => {}
+                Some("rate_limit_event") | Some("stream_event") | Some("compact_boundary") => {}
                 _ => {
                     // Unknown event type — surface as malformed so the
                     // operator can investigate, but keep going.
                     sink.emit(Event::Malformed {
-                        excerpt: format!(
-                            "unknown claude stream event: {}",
-                            truncate(&line, 240)
-                        ),
+                        excerpt: format!("unknown claude stream event: {}", truncate(&line, 240)),
                     });
                 }
             }
@@ -430,10 +421,7 @@ fn render_write(input: &Value) -> String {
         .get("file_path")
         .and_then(|v| v.as_str())
         .unwrap_or("?");
-    let content = input
-        .get("content")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let content = input.get("content").and_then(|v| v.as_str()).unwrap_or("");
     let total_lines = content.lines().count();
     let bytes = content.len();
     let mut out = format!("[Write] {path} ({bytes} bytes, {total_lines} lines)");
@@ -467,9 +455,11 @@ fn render_multi_edit(input: &Value) -> String {
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    let mut out = format!("[MultiEdit] {path} ({} edit{})",
+    let mut out = format!(
+        "[MultiEdit] {path} ({} edit{})",
         edits.len(),
-        if edits.len() == 1 { "" } else { "s" });
+        if edits.len() == 1 { "" } else { "s" }
+    );
     for (i, edit) in edits.iter().enumerate() {
         let old_s = edit
             .get("old_string")
@@ -490,10 +480,7 @@ fn render_notebook_edit(input: &Value) -> String {
         .get("notebook_path")
         .and_then(|v| v.as_str())
         .unwrap_or("?");
-    let cell_id = input
-        .get("cell_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("?");
+    let cell_id = input.get("cell_id").and_then(|v| v.as_str()).unwrap_or("?");
     let mode = input
         .get("edit_mode")
         .and_then(|v| v.as_str())

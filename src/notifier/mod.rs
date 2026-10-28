@@ -123,8 +123,7 @@ pub fn load_notifier_config() -> Option<NotifierStoredConfig> {
 pub fn save_notifier_config(cfg: &NotifierStoredConfig) -> Result<PathBuf, String> {
     let path = notifier_config_path().ok_or_else(|| "HOME is not set".to_string())?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("create {}: {e}", parent.display()))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
     }
     let json = serde_json::to_string_pretty(cfg).map_err(|e| format!("serialize: {e}"))?;
     std::fs::write(&path, json).map_err(|e| format!("write {}: {e}", path.display()))?;
@@ -144,10 +143,7 @@ pub fn save_notifier_config(cfg: &NotifierStoredConfig) -> Result<PathBuf, Strin
 /// Build a live notifier from a stored config. Returns an `Arc` so the
 /// daemon can clone the handle into per-task spawned futures without
 /// touching the underlying transport state.
-pub fn build_notifier(
-    cfg: &NotifierStoredConfig,
-    http: reqwest::Client,
-) -> Arc<dyn Notifier> {
+pub fn build_notifier(cfg: &NotifierStoredConfig, http: reqwest::Client) -> Arc<dyn Notifier> {
     match cfg.kind {
         NotifierKind::Telegram => Arc::new(telegram::TelegramNotifier::new(
             cfg.bot_token.clone(),

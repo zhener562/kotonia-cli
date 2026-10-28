@@ -138,10 +138,7 @@ impl HistoryStore {
         let session_id = session_id.into();
         std::fs::create_dir_all(dir.as_ref())?;
         let path = dir.as_ref().join(format!("{session_id}.jsonl"));
-        let writer = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let writer = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok(Self {
             session_id,
             path,
@@ -269,10 +266,7 @@ pub fn load_session_messages_in(
                 "assistant" => ChatRole::Assistant,
                 _ => continue,
             };
-            msgs.push(ChatMsg {
-                role: r,
-                content,
-            });
+            msgs.push(ChatMsg { role: r, content });
         }
     }
     Ok(msgs)
@@ -321,9 +315,7 @@ pub fn load_session_metadata_in(
 /// observations and extracting `final_answer` tool calls. When both formats
 /// exist, matching legacy rows are de-duplicated in favour of the explicit UI
 /// row while preserving older turns from before protocol v2.
-pub fn load_session_transcript(
-    session_id: &str,
-) -> Result<Vec<TranscriptMessage>, HistoryError> {
+pub fn load_session_transcript(session_id: &str) -> Result<Vec<TranscriptMessage>, HistoryError> {
     load_session_transcript_in(HistoryStore::default_dir()?, session_id)
 }
 
@@ -458,8 +450,7 @@ fn legacy_user_message(content: &str) -> Option<String> {
     }
     if let Some(pos) = text.rfind("Reply in \"") {
         let tail = &text[pos..];
-        const END: &str =
-            "If the user writes in another language, reply in that language instead.";
+        const END: &str = "If the user writes in another language, reply in that language instead.";
         if let Some(end) = tail.find(END) {
             let after = tail[end + END.len()..].trim();
             if !after.is_empty() {
@@ -492,11 +483,7 @@ fn legacy_assistant_message(content: &str) -> Option<String> {
 
     if let Some(start) = text.find("<<<FINAL_ANSWER>>>") {
         let tail = &text[start + "<<<FINAL_ANSWER>>>".len()..];
-        let answer = tail
-            .split("<<<END>>>")
-            .next()
-            .unwrap_or(tail)
-            .trim();
+        let answer = tail.split("<<<END>>>").next().unwrap_or(tail).trim();
         if !answer.is_empty() {
             return Some(answer.to_string());
         }
@@ -561,7 +548,9 @@ mod tests {
             .write_header("gemma4", "local", "auto", Path::new("/tmp/foo"), false)
             .unwrap();
         store.append_message(&ChatRole::User, "こんにちは").unwrap();
-        store.append_message(&ChatRole::Assistant, "hello back").unwrap();
+        store
+            .append_message(&ChatRole::Assistant, "hello back")
+            .unwrap();
         store.append_observation(0, false, false).unwrap();
         store.append_message(&ChatRole::User, "[exit 0]").unwrap();
 

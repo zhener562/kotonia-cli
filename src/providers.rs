@@ -108,14 +108,13 @@ impl ProviderSpec {
                 canon
             }
             ProviderHook::DeepSeekThinking => {
-                let (canon, thinking_enabled) =
-                    match requested_model.strip_suffix(":thinking") {
-                        Some(stripped) => (stripped.to_string(), true),
-                        None => (
-                            requested_model.to_string(),
-                            requested_model == "deepseek-reasoner",
-                        ),
-                    };
+                let (canon, thinking_enabled) = match requested_model.strip_suffix(":thinking") {
+                    Some(stripped) => (stripped.to_string(), true),
+                    None => (
+                        requested_model.to_string(),
+                        requested_model == "deepseek-reasoner",
+                    ),
+                };
                 extra_body.insert(
                     "thinking".into(),
                     json!({
@@ -181,7 +180,9 @@ impl ProviderRegistry {
                     model_index.insert(m.clone(), name.clone());
                 }
                 if let Some(default_model) = entry.default_model.as_deref() {
-                    model_index.entry(default_model.into()).or_insert_with(|| name.clone());
+                    model_index
+                        .entry(default_model.into())
+                        .or_insert_with(|| name.clone());
                 }
                 specs.insert(name, spec);
             }
@@ -283,11 +284,7 @@ fn file_entry_to_spec(name: &str, entry: &ProviderFileEntry) -> Result<ProviderS
             "providers.json provider `{name}`: `base_url` is required"
         ));
     }
-    let max_tokens_param = match entry
-        .max_tokens_param
-        .as_deref()
-        .unwrap_or("max_tokens")
-    {
+    let max_tokens_param = match entry.max_tokens_param.as_deref().unwrap_or("max_tokens") {
         "max_tokens" => MaxTokensParam::MaxTokens,
         "max_completion_tokens" => MaxTokensParam::MaxCompletionTokens,
         "max_output_tokens" => MaxTokensParam::MaxOutputTokens,
@@ -386,7 +383,11 @@ mod tests {
         let spec = kotonia_builtin();
         // Bare basic and the `kotonia-llm` alias default to no-think, and the
         // explicit `:nothink` suffix is still honoured — none set a token floor.
-        for id in ["kotonia-llm-basic", "kotonia-llm", "kotonia-llm-basic:nothink"] {
+        for id in [
+            "kotonia-llm-basic",
+            "kotonia-llm",
+            "kotonia-llm-basic:nothink",
+        ] {
             let r = spec.resolve_request(id);
             assert_eq!(
                 r.extra_body["chat_template_kwargs"],
@@ -418,8 +419,7 @@ mod tests {
     #[test]
     fn registry_explicit_provider_wins() {
         let reg = ProviderRegistry::load().unwrap();
-        let (spec, _) =
-            reg.resolve(Some("deepseek"), "some-custom-model").unwrap();
+        let (spec, _) = reg.resolve(Some("deepseek"), "some-custom-model").unwrap();
         assert_eq!(spec.name, "deepseek");
     }
 

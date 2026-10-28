@@ -388,8 +388,8 @@ async fn main() -> ExitCode {
     // The kotonia /api/v1 helper banner only applies to the ReAct prompt
     // (the model is told it can shell out to the API). ClaudeCode runs its
     // own tool surface, so we suppress this for that engine.
-    let kotonia_api_enabled = matches!(engine_choice, EngineChoice::ReAct)
-        && std::env::var("KOTONIA_API_KEY").is_ok();
+    let kotonia_api_enabled =
+        matches!(engine_choice, EngineChoice::ReAct) && std::env::var("KOTONIA_API_KEY").is_ok();
 
     let mut agent = match engine_choice {
         EngineChoice::ReAct => {
@@ -516,7 +516,9 @@ async fn main() -> ExitCode {
 
     let outcome = if let Some(task) = cli.prompt.clone() {
         // One-shot.
-        agent.run_turn(&task, &mut approval_handler, &mut sink).await
+        agent
+            .run_turn(&task, &mut approval_handler, &mut sink)
+            .await
     } else if interactive {
         // REPL mode.
         repl(&mut agent, &mut approval_handler, &mut sink).await
@@ -524,7 +526,9 @@ async fn main() -> ExitCode {
         // Pipe / non-TTY stdin: treat the entire stdin as a single prompt.
         match read_stdin_to_end() {
             Ok(task) if !task.trim().is_empty() => {
-                agent.run_turn(&task, &mut approval_handler, &mut sink).await
+                agent
+                    .run_turn(&task, &mut approval_handler, &mut sink)
+                    .await
             }
             _ => {
                 eprintln!("kotonia-cli: no prompt (pass as argument or pipe via stdin)");
@@ -979,7 +983,9 @@ async fn run_pair_notifier(args: PairNotifierArgs) -> ExitCode {
             }
         },
         "discord" => {
-            eprintln!("kotonia-cli pair-notifier: discord support is planned but not implemented yet.");
+            eprintln!(
+                "kotonia-cli pair-notifier: discord support is planned but not implemented yet."
+            );
             return ExitCode::from(2);
         }
         other => {
@@ -1032,8 +1038,9 @@ fn print_sessions_and_exit() -> ExitCode {
                     .modified
                     .duration_since(std::time::UNIX_EPOCH)
                     .ok()
-                    .and_then(|d| chrono::DateTime::<chrono::Utc>::from_timestamp(d.as_secs() as i64, 0))
-                {
+                    .and_then(|d| {
+                        chrono::DateTime::<chrono::Utc>::from_timestamp(d.as_secs() as i64, 0)
+                    }) {
                     Some(dt) => dt.format("%Y-%m-%d %H:%M UTC").to_string(),
                     None => "?".to_string(),
                 };
@@ -1143,9 +1150,7 @@ struct StdioApproval {
 
 impl StdioApproval {
     fn new() -> Self {
-        Self {
-            stdin: io::stdin(),
-        }
+        Self { stdin: io::stdin() }
     }
 }
 

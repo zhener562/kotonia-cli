@@ -11,12 +11,8 @@
 
 use serde_json::{Map, Value};
 
-use crate::ai::openai_compat::{
-    create_with_tools as oai_create_with_tools, OpenAiCompatConfig,
-};
-use crate::ai::{
-    AiCallOptions, AiContent, AiMessage, AiResponse, AiRole, AiStopReason, AiUsage,
-};
+use crate::ai::openai_compat::{create_with_tools as oai_create_with_tools, OpenAiCompatConfig};
+use crate::ai::{AiCallOptions, AiContent, AiMessage, AiResponse, AiRole, AiStopReason, AiUsage};
 use crate::providers::{ProviderRegistry, ProviderSpec};
 
 #[derive(Clone, Debug)]
@@ -132,9 +128,7 @@ impl Provider {
     fn require_api_key(&self) -> Result<String, ProviderError> {
         self.spec.api_key.clone().ok_or_else(|| {
             let hint = match self.spec.name.as_str() {
-                "kotonia" => {
-                    "Run `kotonia-cli login`, or export KOTONIA_API_KEY.".to_string()
-                }
+                "kotonia" => "Run `kotonia-cli login`, or export KOTONIA_API_KEY.".to_string(),
                 "deepseek" => "Set DEEPSEEK_API_KEY in your environment.".to_string(),
                 other => format!(
                     "Set its api_key_env in ~/.kotonia/providers.json, or export the \
@@ -185,8 +179,11 @@ impl Provider {
     ) -> Result<String, ProviderError> {
         let mut last_err: Option<ProviderError> = None;
         for attempt in 1..=max_attempts {
-            let ai_msgs: Vec<AiMessage> =
-                messages.iter().cloned().map(chatmsg_to_ai_message).collect();
+            let ai_msgs: Vec<AiMessage> = messages
+                .iter()
+                .cloned()
+                .map(chatmsg_to_ai_message)
+                .collect();
             let options = AiCallOptions::new(self.canonical_model.clone(), max_tokens);
             let config = self.build_config()?;
             let result = oai_create_with_tools(&self.client, config, ai_msgs, options)
@@ -196,9 +193,10 @@ impl Provider {
                     crate::ai::AiError::Http(m) | crate::ai::AiError::Parse(m) => {
                         ProviderError::Transport(m)
                     }
-                    crate::ai::AiError::Api { status, message } => ProviderError::Api(
-                        format!("API error{}: {message}", status.map(|s| format!(" ({s})")).unwrap_or_default()),
-                    ),
+                    crate::ai::AiError::Api { status, message } => ProviderError::Api(format!(
+                        "API error{}: {message}",
+                        status.map(|s| format!(" ({s})")).unwrap_or_default()
+                    )),
                     crate::ai::AiError::Invalid(m) => ProviderError::Api(m),
                 });
             match result {
@@ -340,10 +338,12 @@ mod tests {
         assert!(!is_transient_transport_error(&ProviderError::Api(
             "API error (401): unauthorized".into()
         )));
-        assert!(!is_transient_transport_error(&ProviderError::MissingApiKey {
-            provider: "x".into(),
-            hint: "y".into(),
-        }));
+        assert!(!is_transient_transport_error(
+            &ProviderError::MissingApiKey {
+                provider: "x".into(),
+                hint: "y".into(),
+            }
+        ));
         assert!(!is_transient_transport_error(&ProviderError::Config(
             "bad json".into()
         )));

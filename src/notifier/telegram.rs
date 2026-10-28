@@ -16,7 +16,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use serde::Deserialize;
 
-use super::{ApprovalDecision, ApprovalRequest, Notifier, NotifierError, NotifierKind, NotifierStoredConfig};
+use super::{
+    ApprovalDecision, ApprovalRequest, Notifier, NotifierError, NotifierKind, NotifierStoredConfig,
+};
 
 const API_BASE: &str = "https://api.telegram.org";
 /// Prefix for our `callback_data` strings — guards against unrelated bot
@@ -265,7 +267,8 @@ impl TelegramNotifier {
             .map_err(|e| NotifierError::Network(e.to_string()))?;
         if !resp.ok {
             return Err(NotifierError::Other(
-                resp.description.unwrap_or_else(|| "getUpdates failed".into()),
+                resp.description
+                    .unwrap_or_else(|| "getUpdates failed".into()),
             ));
         }
         Ok(resp.result.unwrap_or_default())
@@ -336,7 +339,8 @@ impl TelegramNotifier {
                 .map_err(|e| NotifierError::Network(e.to_string()))?;
             if !resp.ok {
                 return Err(NotifierError::Other(
-                    resp.description.unwrap_or_else(|| "getUpdates failed".into()),
+                    resp.description
+                        .unwrap_or_else(|| "getUpdates failed".into()),
                 ));
             }
             for upd in resp.result.unwrap_or_default() {
@@ -450,10 +454,7 @@ fn compose_request_text(req: &ApprovalRequest) -> String {
         }
     }
     if let Some(ip) = &req.origin_ip {
-        text.push_str(&format!(
-            "Origin IP: <code>{}</code>\n",
-            html_escape(ip)
-        ));
+        text.push_str(&format!("Origin IP: <code>{}</code>\n", html_escape(ip)));
     }
     if let Some(ua) = &req.user_agent {
         text.push_str(&format!("Browser: {}\n", html_escape(&short(ua, 80))));
