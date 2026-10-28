@@ -93,6 +93,17 @@ pub enum Event {
     Malformed {
         excerpt: String,
     },
+    /// The conversation was compacted to stay inside the model's window
+    /// (see `compaction`). Token counts are estimates. `summarised` older
+    /// messages were folded into notes; when `summary_failed`, they were
+    /// kept with their outputs stubbed instead.
+    ContextCompacted {
+        before_tokens: u64,
+        after_tokens: u64,
+        stubbed: u64,
+        summarised: u64,
+        summary_failed: bool,
+    },
     Error {
         message: String,
     },
@@ -368,7 +379,7 @@ impl Agent {
             });
 
             sink.emit(Event::LlmThinking);
-            self.compact_if_needed().await;
+            self.compact_if_needed(sink).await;
             let assistant_text = match self
                 .provider
                 .complete(self.messages.clone(), self.config.max_tokens)
@@ -515,7 +526,7 @@ impl Agent {
                 max: self.config.max_iterations,
             });
             sink.emit(Event::LlmThinking);
-            self.compact_if_needed().await;
+            self.compact_if_needed(sink).await;
 
             let response = match self.complete_native().await {
                 Ok(r) => r,
@@ -688,7 +699,7 @@ impl Agent {
     /// `compaction`). Rewrites only the in-memory conversation: the
     /// session log on disk keeps everything, and a resumed session is
     /// compacted again on its first call.
-    async fn compact_if_needed(&mut self) {
+    async fn compact_if_needed(&mut self, sink: &mut dyn EventSink) {
         let budget =
             compaction::Budget::for_model(self.provider.model_id(), self.config.max_tokens);
         let fixed = if self.native_mode {
@@ -727,7 +738,9 @@ impl Agent {
             )
         };
         let after_stub = estimate(self);
+        let mut stubbed = stubbed;
         let mut summarised = 0;
+        let mut summary_failed = false;
         if after_stub > budget.target_tokens {
             let summary_tokens = self.config.max_tokens.max(2_048);
             let keep = budget
@@ -793,27 +806,30 @@ impl Agent {
                     }
                     // Keep the task and the reasoning; only outputs go.
                     Err(_) => {
-                        if self.native_mode {
-                            compaction::stub_prefix_native(&mut self.native_messages, cut);
+                        summary_failed = true;
+                        stubbed += if self.native_mode {
+                            compaction::stub_prefix_native(&mut self.native_messages, cut)
                         } else {
-                            compaction::stub_prefix_chat(&mut self.messages, cut);
-                        }
+                            compaction::stub_prefix_chat(&mut self.messages, cut)
+                        };
                     }
                 }
-                summarised = cut;
+                if !summary_failed {
+                    summarised = cut;
+                }
             }
         }
-        eprintln!(
-            "kotonia-cli: context ~{before} tokens over {} — stubbed {stubbed} old outputs \
-             (~{after_stub}){}; now ~{} tokens",
-            budget.trigger_tokens,
-            if summarised > 0 {
-                format!(", summarised {summarised} older messages")
-            } else {
-                String::new()
-            },
-            estimate(self)
-        );
+        let after = estimate(self);
+        if after == before {
+            return;
+        }
+        sink.emit(Event::ContextCompacted {
+            before_tokens: before as u64,
+            after_tokens: after as u64,
+            stubbed: stubbed as u64,
+            summarised: summarised as u64,
+            summary_failed,
+        });
     }
 
     /// One LLM call on the native path. Sends `tool_choice: "required"`

@@ -1123,6 +1123,18 @@ impl EventSink for StdoutSink {
                     println!("{answer}");
                 }
             }
+            Event::ContextCompacted {
+                before_tokens,
+                after_tokens,
+                stubbed,
+                summarised,
+                summary_failed,
+            } => {
+                println!(
+                    "\n[context compacted: ~{before_tokens} → ~{after_tokens} tokens{}]",
+                    compaction_detail(stubbed, summarised, summary_failed)
+                );
+            }
             Event::Malformed { excerpt } => {
                 println!("\n[malformed model output — retrying]");
                 println!("{}…", excerpt.trim());
@@ -1171,5 +1183,24 @@ impl ApprovalHandler for StdioApproval {
         } else {
             ApprovalOutcome::Deny
         }
+    }
+}
+
+/// ", 3 old outputs stubbed, 12 older messages summarised" for the TTY line.
+fn compaction_detail(stubbed: u64, summarised: u64, summary_failed: bool) -> String {
+    let mut parts = Vec::new();
+    if stubbed > 0 {
+        parts.push(format!("{stubbed} old outputs stubbed"));
+    }
+    if summarised > 0 {
+        parts.push(format!("{summarised} older messages summarised"));
+    }
+    if summary_failed {
+        parts.push("summary failed, outputs stubbed instead".to_string());
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(", {}", parts.join(", "))
     }
 }

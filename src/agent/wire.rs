@@ -90,6 +90,13 @@ pub enum WireEvent {
     Malformed {
         excerpt: String,
     },
+    ContextCompacted {
+        before_tokens: u64,
+        after_tokens: u64,
+        stubbed: u64,
+        summarised: u64,
+        summary_failed: bool,
+    },
     Error {
         message: String,
     },
@@ -126,6 +133,19 @@ impl WireEvent {
             },
             Event::Final { answer } => Self::Final { answer },
             Event::Malformed { excerpt } => Self::Malformed { excerpt },
+            Event::ContextCompacted {
+                before_tokens,
+                after_tokens,
+                stubbed,
+                summarised,
+                summary_failed,
+            } => Self::ContextCompacted {
+                before_tokens,
+                after_tokens,
+                stubbed,
+                summarised,
+                summary_failed,
+            },
             Event::Error { message } => Self::Error { message },
             Event::Done {
                 iterations,
@@ -135,5 +155,36 @@ impl WireEvent {
                 success,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::agent::Event;
+
+    /// kotonia.ai's backend mirrors these by `kind` (`domain/agent_wire.rs`)
+    /// and drops frames it cannot parse, so the field names are a contract.
+    #[test]
+    fn context_compacted_wire_shape() {
+        let v = serde_json::to_value(WireEvent::from_event(Event::ContextCompacted {
+            before_tokens: 20_000,
+            after_tokens: 13_000,
+            stubbed: 2,
+            summarised: 5,
+            summary_failed: false,
+        }))
+        .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "kind": "context_compacted",
+                "before_tokens": 20_000,
+                "after_tokens": 13_000,
+                "stubbed": 2,
+                "summarised": 5,
+                "summary_failed": false,
+            })
+        );
     }
 }
