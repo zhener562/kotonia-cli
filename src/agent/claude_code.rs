@@ -278,6 +278,7 @@ impl ClaudeCodeEngine {
                             exit_code: if is_error { 1 } else { 0 },
                             timed_out: false,
                             truncated: false,
+                            full_output_path: None,
                         };
                         sink.emit(Event::Observation { result });
                     }

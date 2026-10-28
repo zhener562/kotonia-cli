@@ -19,6 +19,24 @@ const LINE_BUF_INITIAL: usize = 4096;
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
 const MAX_CAPTURE_BYTES: usize = 256 * 1024;
 
+/// What the *model* sees of one command's output. `combined` keeps up to
+/// `MAX_CAPTURE_BYTES` for the UI; the observation is shaped down to this,
+/// because every observation is resent on every later request in the
+/// session. Measured on the local session logs: the 5 largest observations
+/// were 63% of all observation bytes, and the top two (262 KB of base64
+/// from a curl, 248 KB from a `grep | head -20` that hit one minified-JSON
+/// line) each filled the context on their own.
+const OBS_MAX_BYTES: usize = 16 * 1024;
+/// Head/tail split when an observation is over `OBS_MAX_BYTES`. The tail
+/// gets less, but it is where errors and exit summaries land.
+const OBS_HEAD_BYTES: usize = 10 * 1024;
+const OBS_TAIL_BYTES: usize = 5 * 1024;
+/// `head -n` limits lines, not bytes, so one long line slips through it.
+const OBS_LINE_MAX_BYTES: usize = 2000;
+/// A line at least this long made only of base64 / base64url characters is
+/// data, not something the model can read.
+const OBS_BASE64_MIN_BYTES: usize = 256;
+
 #[derive(Debug)]
 pub enum HostExecutorError {
     Spawn(std::io::Error),
@@ -137,8 +155,13 @@ pub struct ExecutionResult {
     pub exit_code: i32,
     pub timed_out: bool,
     pub truncated: bool,
-    /// stdout + stderr interleaved, in arrival order. This is what the agent sees.
+    /// stdout + stderr interleaved, in arrival order. Shown as-is to the
+    /// operator; the model sees `as_observation()`, which shapes it down.
     pub combined: String,
+    /// Where the full `combined` was written when the observation had to
+    /// cut something, so the model can grep/sed it instead of re-running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub full_output_path: Option<PathBuf>,
 }
 
 impl ExecutionResult {
@@ -153,11 +176,123 @@ impl ExecutionResult {
             header.push_str(" [output truncated]");
         }
         if self.combined.is_empty() {
-            header
-        } else {
-            format!("{header}\n{}", self.combined)
+            return header;
         }
+        let body = shape_observation(&self.combined);
+        if body.elided {
+            match &self.full_output_path {
+                Some(p) => header.push_str(&format!(
+                    " [shortened for context; full output ({} bytes) saved to {}]",
+                    self.combined.len(),
+                    p.display()
+                )),
+                None => header.push_str(" [shortened for context]"),
+            }
+        }
+        format!("{header}\n{}", body.text)
     }
+}
+
+struct ShapedObservation {
+    text: String,
+    /// Whether anything was cut (a long line, base64, or the middle).
+    elided: bool,
+}
+
+fn shape_observation(combined: &str) -> ShapedObservation {
+    let mut elided = false;
+    let mut text = String::with_capacity(combined.len().min(OBS_MAX_BYTES + 256));
+    for line in combined.split_inclusive('\n') {
+        let (body, nl) = match line.strip_suffix('\n') {
+            Some(b) => (b, "\n"),
+            None => (line, ""),
+        };
+        if looks_like_base64(body) {
+            text.push_str(&format!("[base64-like data: {} bytes omitted]", body.len()));
+            elided = true;
+        } else if body.len() > OBS_LINE_MAX_BYTES {
+            let end = floor_char_boundary(body, OBS_LINE_MAX_BYTES);
+            text.push_str(&body[..end]);
+            text.push_str(&format!(" … [line cut: +{} bytes]", body.len() - end));
+            elided = true;
+        } else {
+            text.push_str(body);
+        }
+        text.push_str(nl);
+    }
+    if text.len() > OBS_MAX_BYTES {
+        text = keep_head_and_tail(&text);
+        elided = true;
+    }
+    ShapedObservation { text, elided }
+}
+
+/// Keep whole lines from the start up to `OBS_HEAD_BYTES` and from the end
+/// up to `OBS_TAIL_BYTES`, with a marker saying how much was dropped.
+fn keep_head_and_tail(text: &str) -> String {
+    let mut head_end = 0;
+    for (i, _) in text.match_indices('\n') {
+        if i + 1 > OBS_HEAD_BYTES {
+            break;
+        }
+        head_end = i + 1;
+    }
+    let mut tail_start = text.len();
+    for (i, _) in text.rmatch_indices('\n') {
+        // `i` is the newline ending the previous line; the tail starts after it.
+        if i + 1 >= text.len() {
+            continue;
+        }
+        if text.len() - (i + 1) > OBS_TAIL_BYTES {
+            break;
+        }
+        tail_start = i + 1;
+    }
+    // Lines can only be OBS_LINE_MAX_BYTES long by now, so these only fall
+    // back to a char cut if a single line is wider than the whole window.
+    if head_end == 0 {
+        head_end = floor_char_boundary(text, OBS_HEAD_BYTES);
+    }
+    if tail_start <= head_end {
+        tail_start = head_end;
+    }
+    let omitted = &text[head_end..tail_start];
+    format!(
+        "{}[… {} lines / {} bytes omitted …]\n{}",
+        &text[..head_end],
+        omitted.lines().count(),
+        omitted.len(),
+        &text[tail_start..]
+    )
+}
+
+fn looks_like_base64(line: &str) -> bool {
+    let t = line.trim();
+    t.len() >= OBS_BASE64_MIN_BYTES
+        && t.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_'))
+}
+
+fn floor_char_boundary(s: &str, mut i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Write the full output where the model's next bash call can read it. Lives
+/// under the OS temp dir rather than the worktree so it never shows up in
+/// `git status` or a commit. Best-effort: on failure the observation just
+/// says it was shortened.
+fn save_full_output(combined: &str) -> Option<PathBuf> {
+    let dir = std::env::temp_dir().join("kotonia-cli");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("obs-{}.txt", uuid::Uuid::new_v4()));
+    std::fs::write(&path, combined).ok()?;
+    Some(path)
 }
 
 pub struct HostExecutor {
@@ -272,11 +407,17 @@ impl HostExecutor {
         };
 
         let exit_code = exit_status.code().unwrap_or(-1);
+        let full_output_path = if shape_observation(&combined).elided {
+            save_full_output(&combined)
+        } else {
+            None
+        };
         Ok(ExecutionResult {
             exit_code,
             timed_out,
             truncated,
             combined,
+            full_output_path,
         })
     }
 }
@@ -356,6 +497,77 @@ fn append_capped(buf: &mut String, line: &str, truncated: &mut bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_output_is_passed_through() {
+        let shaped = shape_observation("a\nb\n");
+        assert_eq!(shaped.text, "a\nb\n");
+        assert!(!shaped.elided);
+    }
+
+    #[test]
+    fn a_long_line_is_cut_even_when_line_count_is_small() {
+        // The `grep ... | head -20` case: few lines, one of them huge.
+        let line = "{\"k\":\"v\"},".repeat(5_000);
+        let shaped = shape_observation(&format!("ok\n{line}\nend\n"));
+        assert!(shaped.elided);
+        assert!(shaped.text.len() < OBS_LINE_MAX_BYTES + 200);
+        assert!(shaped.text.contains("[line cut: +48000 bytes]"));
+        assert!(shaped.text.ends_with("end\n"));
+    }
+
+    #[test]
+    fn base64_is_replaced_by_its_size() {
+        let b64 = "QUJD".repeat(1000);
+        let shaped = shape_observation(&format!("{{\"image\":\n{b64}\n}}\n"));
+        assert!(shaped
+            .text
+            .contains("[base64-like data: 4000 bytes omitted]"));
+        assert!(!shaped.text.contains("QUJDQUJD"));
+    }
+
+    #[test]
+    fn many_lines_keep_head_and_tail() {
+        let body: String = (0..5000).map(|i| format!("line {i}\n")).collect();
+        let shaped = shape_observation(&body);
+        assert!(shaped.elided);
+        assert!(shaped.text.len() <= OBS_HEAD_BYTES + OBS_TAIL_BYTES + 100);
+        assert!(shaped.text.starts_with("line 0\n"));
+        assert!(shaped.text.ends_with("line 4999\n"));
+        assert!(shaped.text.contains("lines /"));
+    }
+
+    #[test]
+    fn multibyte_lines_are_cut_on_char_boundaries() {
+        let line = "あ".repeat(5000);
+        let shaped = shape_observation(&line);
+        assert!(shaped.elided);
+        assert!(shaped.text.starts_with("あ"));
+    }
+
+    #[tokio::test]
+    async fn oversized_output_is_saved_and_pointed_to() {
+        let exec = HostExecutor::new(std::env::temp_dir());
+        let r = exec
+            .bash("head -c 100000 /dev/zero | tr '\\0' a; echo; echo done")
+            .await
+            .unwrap();
+        let path = r.full_output_path.clone().expect("full output saved");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), r.combined);
+        let obs = r.as_observation();
+        assert!(obs.contains(&path.display().to_string()));
+        assert!(obs.len() < OBS_LINE_MAX_BYTES + 500);
+        assert!(obs.trim_end().ends_with("done"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn small_output_writes_no_file() {
+        let exec = HostExecutor::new(std::env::temp_dir());
+        let r = exec.bash("echo hi").await.unwrap();
+        assert!(r.full_output_path.is_none());
+        assert_eq!(r.as_observation(), "[exit 0]\nhi\n");
+    }
 
     #[tokio::test]
     async fn echoes_stdout() {
