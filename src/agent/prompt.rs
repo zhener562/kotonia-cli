@@ -72,7 +72,7 @@ cat README.md
 
 {FINAL_OPEN}
 This is the hage repo — Next.js + Rust voice chat platform with Ditto avatars
-and Qwen3-TTS. The README walks through dev/prod ports and the build pipeline.
+and VoxCPM2. The README walks through dev/prod ports and the build pipeline.
 {FINAL_CLOSE}
 
 User: "Check that cargo builds."
@@ -190,7 +190,7 @@ User: "What does this repo do?"
 → tool_call bash `cat README.md`
 → (observe the README)
 → tool_call final_answer `This is the hage repo — Next.js + Rust voice
-   chat platform with Ditto avatars and Qwen3-TTS. The README walks
+   chat platform with Ditto avatars and VoxCPM2. The README walks
    through dev/prod ports and the build pipeline.`
 
 User: "Show me 3 recent posts about Tokio task budgets."
@@ -240,7 +240,7 @@ so the operator can pick them up.
 Endpoints (OpenAI-compatible naming, JSON):
 
 - `POST /images/generations`  → HiDream image gen. Synchronous, ~30s.
-- `POST /audio/generations`   → Qwen3-TTS speech. Synchronous, ~200ms.
+- `POST /audio/generations`   → VoxCPM2 speech. Synchronous, ~200ms.
 - `POST /videos/generations`  → LTX-2 short video. Async, returns job id.
 - `GET  /videos/generations/{{id}}` → poll the video job until `completed`.
 
@@ -296,7 +296,7 @@ so the operator can pick them up.
 Endpoints (OpenAI-compatible naming, JSON):
 
 - `POST /images/generations`  → HiDream image gen. Synchronous, ~30s.
-- `POST /audio/generations`   → Qwen3-TTS speech. Synchronous, ~200ms.
+- `POST /audio/generations`   → VoxCPM2 speech. Synchronous, ~200ms.
 - `POST /videos/generations`  → LTX-2 short video. Async, returns job id.
 - `GET  /videos/generations/{{id}}` → poll the video job until `completed`.
 
@@ -340,7 +340,7 @@ without `loras` and surface that the operator's account is on free tier.
 curl -sS -X POST "{base}/api/v1/audio/generations" \
   -H "Authorization: Bearer $KOTONIA_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{{"input":"こんにちは、世界","language":"ja","engine":"qwen3"}}' \
+  -d '{{"input":"こんにちは、世界","language":"ja","engine":"voxcpm"}}' \
   | jq -r '.audio.b64' | base64 -d > ./hello.wav && ls -l ./hello.wav
 {BASH_CLOSE}
 
