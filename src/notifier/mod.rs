@@ -106,6 +106,11 @@ pub trait Notifier: Send + Sync {
         req: ApprovalRequest,
         timeout: Duration,
     ) -> Result<ApprovalDecision, NotifierError>;
+
+    /// Push a plain message (no buttons). Used by the resident agent's
+    /// heartbeat and reminders so they reach the phone while the user is
+    /// away from the machine.
+    async fn send_text(&self, text: &str) -> Result<(), NotifierError>;
 }
 
 // ── persistence ─────────────────────────────────────────────────────────

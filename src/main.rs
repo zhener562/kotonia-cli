@@ -38,6 +38,11 @@ use kotonia_cli::agent::provider::Provider;
 use kotonia_cli::agent::worktree::AgentWorkspace;
 use kotonia_cli::config as daemon_config;
 use kotonia_cli::daemon::{self, DaemonConfig};
+use kotonia_cli::home::feed::Delivery as HomeDelivery;
+use kotonia_cli::home::heartbeat as home_heartbeat;
+use kotonia_cli::home::runner as home_runner;
+use kotonia_cli::home::schedule as home_schedule;
+use kotonia_cli::home::workspace::{self as home_workspace, HomeDir};
 use kotonia_cli::login;
 use kotonia_cli::notifier;
 use kotonia_cli::serve;
@@ -87,6 +92,71 @@ enum Cmd {
     /// new browser session. The approval channel is independent of
     /// kotonia.ai — a compromised backend cannot forge an approve signal.
     PairNotifier(PairNotifierArgs),
+
+    /// Resident agent ("home"): a persistent workspace of memory files plus
+    /// a heartbeat and reminders that survive the machine sleeping.
+    /// `kotonia-cli home init` to start, `kotonia-cli home run` to stay resident.
+    Home(HomeArgs),
+}
+
+#[derive(Args, Debug)]
+struct HomeArgs {
+    #[command(subcommand)]
+    cmd: HomeCmd,
+}
+
+#[derive(Subcommand, Debug)]
+enum HomeCmd {
+    /// Create ~/.kotonia/home (or $KOTONIA_HOME_DIR) with template files.
+    /// Never overwrites an existing file.
+    Init,
+    /// Print the block that is prepended to every conversation.
+    Prompt,
+    /// Turn the heartbeat on (`--every 30`, minutes) or off (`--off`).
+    Heartbeat {
+        #[arg(long, default_value_t = 30)]
+        every: i64,
+        #[arg(long)]
+        off: bool,
+    },
+    /// Local hours in which the heartbeat may reach out, `HH:MM-HH:MM`
+    /// (default 09:00-21:30). Reminders ignore this.
+    Hours { range: String },
+    /// Add a one-off reminder. WHEN is `+30m` / `+2h` / `HH:MM` /
+    /// `YYYY-MM-DD HH:MM` (local) or RFC 3339.
+    Remind { when: String, text: Vec<String> },
+    /// List scheduled jobs.
+    List,
+    /// Remove a job by id.
+    Remove { id: String },
+    /// Evaluate the schedule once (what `run` does every minute).
+    Tick {
+        #[command(flatten)]
+        run: HomeRunArgs,
+    },
+    /// Stay resident: evaluate the schedule every minute until killed.
+    Run {
+        #[command(flatten)]
+        run: HomeRunArgs,
+    },
+}
+
+#[derive(Args, Debug)]
+struct HomeRunArgs {
+    /// Model for heartbeat runs.
+    #[arg(short, long, default_value = "kotonia-llm-basic")]
+    model: String,
+    #[arg(long)]
+    provider: Option<String>,
+    /// Seconds between schedule checks.
+    #[arg(long, default_value_t = 60)]
+    poll_secs: u64,
+    /// Show what would fire without running or advancing anything.
+    #[arg(long)]
+    dry_run: bool,
+    /// Do not push to the paired phone notifier, even if one is set up.
+    #[arg(long)]
+    no_notifier: bool,
 }
 
 #[derive(Args, Debug)]
@@ -254,6 +324,11 @@ struct RunArgs {
     #[arg(long)]
     force_delimiter: bool,
 
+    /// Load the resident agent's memory files (~/.kotonia/home, see
+    /// `kotonia-cli home init`) into the system prompt.
+    #[arg(long)]
+    home: bool,
+
     /// Speak the JSON stdio protocol (JSONL) instead of the human TTY UI.
     /// For the VS Code extension / machine-readable frontends: stdout carries
     /// the protocol, stderr stays logs. Only the `react` engine is supported.
@@ -299,6 +374,7 @@ async fn real_main() -> ExitCode {
         Some(Cmd::AuthStatus(args)) => return run_auth_status(args).await,
         Some(Cmd::Logout(args)) => return run_logout(args),
         Some(Cmd::PairNotifier(args)) => return run_pair_notifier(args).await,
+        Some(Cmd::Home(args)) => return run_home(args).await,
         None => {}
     }
 
@@ -427,7 +503,14 @@ async fn real_main() -> ExitCode {
             let mut config = AgentConfig::new(approval_mode, in_place);
             config.max_iterations = cli.max_iterations;
             config.force_delimiter = cli.force_delimiter;
-            config.persona_prefix = frontend_system_prompt_prefix();
+            config.persona_prefix = match home_prompt_prefix(cli.home) {
+                Ok(home) => join_prefixes(home, frontend_system_prompt_prefix()),
+                Err(e) => {
+                    eprintln!("kotonia-cli: --home: {e}");
+                    telemetry::fail("bad_args");
+                    return ExitCode::from(2);
+                }
+            };
             config.kotonia_api_base = if std::env::var("KOTONIA_API_KEY").is_ok() {
                 Some(
                     std::env::var("KOTONIA_API_BASE")
@@ -580,6 +663,188 @@ async fn real_main() -> ExitCode {
 
     cleanup_workspace(workspace, cli.keep_worktree, cli.quiet_shutdown).await;
     exit_code
+}
+
+fn home_prompt_prefix(enabled: bool) -> Result<Option<String>, String> {
+    if !enabled {
+        return Ok(None);
+    }
+    let home = HomeDir::resolve()?;
+    if !home.exists() {
+        return Err(format!(
+            "{} is not set up yet; run `kotonia-cli home init` first",
+            home.root().display()
+        ));
+    }
+    Ok(Some(home.prompt_block(
+        home_workspace::DEFAULT_MAX_FILE_CHARS,
+        home_workspace::DEFAULT_MAX_TOTAL_CHARS,
+    )))
+}
+
+/// Home block first (who you are, what you remember), then the frontend's
+/// persona / language instructions.
+fn join_prefixes(a: Option<String>, b: Option<String>) -> Option<String> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(format!("{a}\n\n{b}")),
+        (a, b) => a.or(b),
+    }
+}
+
+async fn run_home(args: HomeArgs) -> ExitCode {
+    let home = match HomeDir::resolve() {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("kotonia-cli home: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    let needs_init = !matches!(args.cmd, HomeCmd::Init);
+    if needs_init && !home.exists() {
+        eprintln!(
+            "kotonia-cli home: {} is not set up yet; run `kotonia-cli home init` first",
+            home.root().display()
+        );
+        return ExitCode::from(1);
+    }
+    let now = chrono::Utc::now();
+    let offset = home_schedule::local_offset_now();
+    let load = || home_schedule::Schedule::load(home.root());
+    let result: Result<(), String> = match args.cmd {
+        HomeCmd::Init => home.ensure_initialized().map(|created| {
+            println!("home: {}", home.root().display());
+            if created.is_empty() {
+                println!("already set up; nothing changed");
+            } else {
+                println!("created: {}", created.join(", "));
+            }
+        }),
+        HomeCmd::Prompt => {
+            println!(
+                "{}",
+                home.prompt_block(
+                    home_workspace::DEFAULT_MAX_FILE_CHARS,
+                    home_workspace::DEFAULT_MAX_TOTAL_CHARS
+                )
+            );
+            Ok(())
+        }
+        HomeCmd::Heartbeat { every, off } => load().and_then(|mut s| {
+            if off {
+                s.clear_heartbeat();
+                println!("heartbeat off");
+            } else {
+                s.set_heartbeat(every * 60, now);
+                let checks = home_heartbeat::checklist(
+                    &home.read(home_workspace::HEARTBEAT_FILE).unwrap_or_default(),
+                );
+                println!("heartbeat every {every} min ({} check(s) in HEARTBEAT.md)", checks.len());
+                if checks.is_empty() {
+                    println!("HEARTBEAT.md has no `- ` items yet, so ticks will do nothing (and cost nothing)");
+                }
+            }
+            s.save(home.root())
+        }),
+        HomeCmd::Hours { range } => match home_schedule::ActiveHours::parse(&range) {
+            Some(h) => load().and_then(|mut s| {
+                s.active_hours = Some(h);
+                println!("active hours {}-{}", h.start.format("%H:%M"), h.end.format("%H:%M"));
+                s.save(home.root())
+            }),
+            None => Err(format!("expected HH:MM-HH:MM, got `{range}`")),
+        },
+        HomeCmd::Remind { when, text } => {
+            let text = text.join(" ");
+            if text.trim().is_empty() {
+                Err("reminder text is empty".to_string())
+            } else {
+                match home_schedule::parse_when(&when, now, offset) {
+                    Some(at) => load().and_then(|mut s| {
+                        let id = s.add_reminder(at, text, now);
+                        println!(
+                            "{id}: {}",
+                            at.with_timezone(&offset).format("%Y-%m-%d %H:%M")
+                        );
+                        s.save(home.root())
+                    }),
+                    None => Err(format!(
+                        "cannot read `{when}` (try +30m, 15:00, \"2026-11-02 09:00\")"
+                    )),
+                }
+            }
+        }
+        HomeCmd::List => load().map(|s| {
+            let h = s.active_hours();
+            println!(
+                "active hours {}-{}",
+                h.start.format("%H:%M"),
+                h.end.format("%H:%M")
+            );
+            if s.jobs.is_empty() {
+                println!("no jobs");
+            }
+            for j in &s.jobs {
+                let due = j.next_due.with_timezone(&offset).format("%m-%d %H:%M");
+                match &j.kind {
+                    home_schedule::JobKind::Heartbeat { every_secs } => {
+                        println!("{}  heartbeat every {} min, next {due}", j.id, every_secs / 60)
+                    }
+                    home_schedule::JobKind::Reminder { text, .. } => {
+                        println!("{}  reminder {due}  {text}", j.id)
+                    }
+                }
+            }
+        }),
+        HomeCmd::Remove { id } => load().and_then(|mut s| {
+            if s.remove(&id) {
+                println!("removed {id}");
+                s.save(home.root())
+            } else {
+                Err(format!("no job `{id}`"))
+            }
+        }),
+        HomeCmd::Tick { run } => {
+            let (cfg, notifier) = home_runner_parts(&run);
+            let delivery = HomeDelivery::new(home.clone(), notifier, true);
+            home_runner::tick(&home, &cfg, &delivery, now, offset)
+                .await
+                .map(|_| ())
+        }
+        HomeCmd::Run { run } => {
+            let (cfg, notifier) = home_runner_parts(&run);
+            home_runner::run_forever(home.clone(), cfg, notifier).await
+        }
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("kotonia-cli home: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn home_runner_parts(
+    run: &HomeRunArgs,
+) -> (
+    home_runner::RunnerConfig,
+    Option<std::sync::Arc<dyn notifier::Notifier>>,
+) {
+    let cfg = home_runner::RunnerConfig {
+        model: run.model.clone(),
+        provider: run.provider.clone(),
+        poll_secs: run.poll_secs,
+        max_iterations: 15,
+        heartbeat_timeout: std::time::Duration::from_secs(600),
+        dry_run: run.dry_run,
+    };
+    let notifier = if run.no_notifier || run.dry_run {
+        None
+    } else {
+        notifier::load_notifier_config()
+            .map(|c| notifier::build_notifier(&c, reqwest::Client::new()))
+    };
+    (cfg, notifier)
 }
 
 fn frontend_system_prompt_prefix() -> Option<String> {

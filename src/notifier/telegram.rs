@@ -127,6 +127,34 @@ impl Notifier for TelegramNotifier {
             .unwrap_or_else(|| "unknown".into()))
     }
 
+    async fn send_text(&self, text: &str) -> Result<(), NotifierError> {
+        // Plain text, no parse_mode: the message comes from the model and may
+        // contain `<`, `*` or backticks that HTML / Markdown mode would choke on.
+        let body = serde_json::json!({
+            "chat_id": self.chat_id,
+            "text": text,
+            "disable_web_page_preview": true,
+        });
+        let resp: TgResp<TgMessage> = self
+            .http
+            .post(self.url("sendMessage"))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| NotifierError::Network(e.to_string()))?
+            .json()
+            .await
+            .map_err(|e| NotifierError::Network(e.to_string()))?;
+        if resp.ok {
+            Ok(())
+        } else {
+            Err(NotifierError::Other(
+                resp.description
+                    .unwrap_or_else(|| "sendMessage failed".into()),
+            ))
+        }
+    }
+
     async fn request_approval(
         &self,
         req: ApprovalRequest,

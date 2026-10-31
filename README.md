@@ -212,6 +212,35 @@ ticks, tool invocations, observations, final answers, errors). The
 first task from each new browser tab triggers a Telegram push asking
 you to approve the session for 24h.
 
+### Home (resident agent, experimental)
+
+A persistent workspace of Markdown files the agent reads at the start of every
+conversation, plus a heartbeat and reminders that keep working across the
+machine sleeping.
+
+```bash
+kotonia-cli home init                       # ~/.kotonia/home (or $KOTONIA_HOME_DIR)
+kotonia-cli --home                          # REPL with SOUL / USER / MEMORY … loaded
+kotonia-cli home remind 15:00 "send the invoice"
+kotonia-cli home heartbeat --every 30       # runs the `- ` items in HEARTBEAT.md
+kotonia-cli home hours 09:00-21:30          # heartbeat stays quiet outside these
+kotonia-cli home list
+kotonia-cli home run                        # stay resident (Ctrl-C to stop)
+kotonia-cli home tick --dry-run             # what would fire right now
+```
+
+- Due times are wall-clock and checked every minute, so a sleeping machine
+  catches up on wake: missed heartbeats collapse into one run, a reminder more
+  than 6 hours late is recorded but not pushed. Nothing wakes the machine.
+- An empty `HEARTBEAT.md` means no model call at all.
+- Heartbeat runs use the `allowlist` approval policy with nobody to approve:
+  anything that needs a human is refused and listed in `feed/<date>.jsonl`.
+  The agent is told not to send, buy, delete or share during a heartbeat.
+- Messages are written to `feed/<date>.jsonl`, printed, and pushed to the
+  paired phone notifier (`pair-notifier`) unless `--no-notifier`.
+- One `home run` per home directory (file lock). Running it on two machines
+  against the same account will double up; there is no cross-device lease yet.
+
 ### Approval modes
 
 `--approval` controls how `bash` commands are gated in the **ReAct**
