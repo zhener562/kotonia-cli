@@ -192,28 +192,113 @@ pub async fn recent(
     Ok(out)
 }
 
+/// Which mailbox a uid belongs to. UIDs are per mailbox, so a uid found by
+/// `search` (All Mail on Gmail) must be read from the same place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mailbox {
+    Inbox,
+    /// Gmail's All Mail (archived mail included); INBOX elsewhere.
+    All,
+}
+
+impl Mailbox {
+    pub fn parse(s: Option<&str>) -> Self {
+        match s.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            Some("all") | Some("all_mail") => Self::All,
+            _ => Self::Inbox,
+        }
+    }
+}
+
+fn is_gmail(record: &ConnectorRecord) -> bool {
+    matches!(&record.kind, ConnectorKind::Imap { host, .. } if host.eq_ignore_ascii_case("imap.gmail.com"))
+}
+
+/// Open `which` read-only; returns the label to show the model.
+async fn open_mailbox(s: &mut ImapSession, which: Mailbox) -> Result<&'static str, String> {
+    if which == Mailbox::All {
+        if let Some(name) = s.all_mail_mailbox().await.map_err(|e| e.to_string())? {
+            s.examine(&name).await.map_err(|e| e.to_string())?;
+            return Ok("all");
+        }
+    }
+    s.examine("INBOX").await.map_err(|e| e.to_string())?;
+    Ok("inbox")
+}
+
+/// Search like the mail client's search box. On Gmail the query is Gmail's
+/// own syntax (`PC 修理`, `from:dospara`, `subject:請求 after:2026/10/01`)
+/// over All Mail, archived messages included; elsewhere a plain text search
+/// of INBOX. Newest first.
+pub async fn search(
+    record: &ConnectorRecord,
+    password: &str,
+    query: &str,
+    limit: usize,
+) -> Result<(&'static str, Vec<MailSummary>), String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Err("empty search query".into());
+    }
+    let (host, port, user, pw) = creds(record, password)?;
+    let gmail = is_gmail(record);
+    let mut s = ImapSession::connect(&host, port)
+        .await
+        .map_err(|e| e.to_string())?;
+    s.login(&user, &pw).await.map_err(|e| e.to_string())?;
+    let mailbox = open_mailbox(&mut s, if gmail { Mailbox::All } else { Mailbox::Inbox }).await?;
+    let mut uids = s
+        .uid_search_query(query, gmail)
+        .await
+        .map_err(|e| e.to_string())?;
+    uids.sort_unstable_by(|a, b| b.cmp(a));
+    uids.truncate(limit.max(1));
+    let fetched = s
+        .uid_fetch(&uids, SUMMARY_FETCH_BYTES)
+        .await
+        .map_err(|e| e.to_string())?;
+    s.logout().await;
+    let mut out: Vec<MailSummary> = fetched
+        .into_iter()
+        .map(|m| summarize(m.uid, m.seen, &m.raw))
+        .collect();
+    out.sort_by(|a, b| b.uid.cmp(&a.uid));
+    Ok((mailbox, out))
+}
+
 pub async fn read(
     record: &ConnectorRecord,
     password: &str,
     uid: u32,
     offset: chrono::FixedOffset,
     parts: bool,
+    mailbox: Mailbox,
 ) -> Result<String, String> {
     let (host, port, user, pw) = creds(record, password)?;
     let mut s = ImapSession::connect(&host, port)
         .await
         .map_err(|e| e.to_string())?;
     s.login(&user, &pw).await.map_err(|e| e.to_string())?;
-    s.examine("INBOX").await.map_err(|e| e.to_string())?;
-    let fetched = s
+    let mut label = open_mailbox(&mut s, mailbox).await?;
+    let mut fetched = s
         .uid_fetch(&[uid], READ_FETCH_BYTES)
         .await
         .map_err(|e| e.to_string())?;
+    // A uid from mail_search lives in Gmail's All Mail. If the model asked
+    // the inbox for it, look there before reporting "not found" (it did
+    // exactly that on the first live run).
+    if mailbox == Mailbox::Inbox && is_gmail(record) && !fetched.iter().any(|m| m.uid == uid) {
+        label = open_mailbox(&mut s, Mailbox::All).await?;
+        fetched = s
+            .uid_fetch(&[uid], READ_FETCH_BYTES)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     s.logout().await;
     let m = fetched
         .into_iter()
         .find(|m| m.uid == uid)
-        .ok_or_else(|| format!("no message with UID {uid} in INBOX"))?;
+        .ok_or_else(|| format!("no message with UID {uid} in {label}"))?;
     Ok(if parts {
         parts_overview(&m.raw)
     } else {

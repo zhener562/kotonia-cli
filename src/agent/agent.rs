@@ -475,6 +475,16 @@ impl Agent {
                     let decision = decide(self.config.approval, &command);
                     let allow = match decision {
                         Decision::Allow => true,
+                        Decision::Refuse { reason } => {
+                            sink.emit(Event::BashSkipped {
+                                command: command.clone(),
+                                reason: reason.clone(),
+                            });
+                            self.push_logged(ChatMsg::user(format!(
+                                "Refused without running: {reason}."
+                            )));
+                            false
+                        }
                         Decision::AskUser { reason } => {
                             let outcome = approval.ask(&command, &reason);
                             if outcome == ApprovalOutcome::Approve {
@@ -1025,6 +1035,13 @@ If the check really needs it, say so in your message to the user."
                 let decision = decide(self.config.approval, &command);
                 let allow = match decision {
                     Decision::Allow => true,
+                    Decision::Refuse { reason } => {
+                        sink.emit(Event::BashSkipped {
+                            command: command.clone(),
+                            reason: reason.clone(),
+                        });
+                        return Ok((format!("Refused without running: {reason}."), true));
+                    }
                     Decision::AskUser { reason } => {
                         let outcome = approval.ask(&command, &reason);
                         if outcome == ApprovalOutcome::Approve {
@@ -1261,7 +1278,7 @@ If the check really needs it, say so in your message to the user."
                     }
                 }
             }
-            "mail_recent" | "mail_read" if self.config.connectors => {
+            "mail_recent" | "mail_read" | "mail_search" if self.config.connectors => {
                 let connector = input.get("connector").and_then(|v| v.as_str());
                 let label = format!("{name} {input}");
                 sink.emit(Event::Bash {
@@ -1596,13 +1613,34 @@ fn mail_tools() -> Vec<AiTool> {
             }),
         },
         AiTool {
-            name: "mail_read".to_string(),
-            description: "Read one message's text by uid (read-only), fenced as untrusted content."
+            name: "mail_search".to_string(),
+            description: "Search the mailbox like the mail client's search box, archived mail \
+                          included. On Gmail the query uses Gmail's own syntax (e.g. `PC 修理`, \
+                          `from:dospara`, `subject:請求 after:2026/10/01`). Newest first. The \
+                          uids it returns belong to mailbox \"all\": read them with \
+                          mail_read {uid, mailbox: \"all\"}."
                 .to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "description": "Max messages, default 20."},
+                    "connector": {"type": "string"}
+                },
+                "required": ["query"]
+            }),
+        },
+        AiTool {
+            name: "mail_read".to_string(),
+            description:
+                "Read one message's text by uid (read-only), fenced as untrusted content. \
+                          Pass mailbox \"all\" for uids that came from mail_search."
+                    .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
                     "uid": {"type": "integer"},
+                    "mailbox": {"type": "string", "enum": ["inbox", "all"], "description": "Default inbox."},
                     "max_chars": {"type": "integer", "description": "Default 12000."},
                     "connector": {"type": "string"}
                 },
@@ -1637,6 +1675,20 @@ async fn run_mail_tool(
             )
         })?;
     let offset = *chrono::Local::now().offset();
+    if name == "mail_search" {
+        let query = input.get("query").and_then(|v| v.as_str()).unwrap_or("");
+        let limit = input
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(20)
+            .clamp(1, 50) as usize;
+        let (mailbox, items) = mail::search(&record, &secret, query, limit).await?;
+        return Ok(format!(
+            "(searched mailbox \"{mailbox}\" for {query:?}: {} result(s); read with mail_read {{uid, mailbox: \"{mailbox}\"}})\n{}",
+            items.len(),
+            mail::format_summaries(&items, offset)
+        ));
+    }
     if name == "mail_recent" {
         let window = if input.get("new").and_then(|v| v.as_bool()).unwrap_or(false) {
             mail::Window::New
@@ -1659,7 +1711,8 @@ async fn run_mail_tool(
             .get("max_chars")
             .and_then(|v| v.as_u64())
             .unwrap_or(12_000) as usize;
-        let text = mail::read(&record, &secret, uid, offset, false).await?;
+        let mailbox = mail::Mailbox::parse(input.get("mailbox").and_then(|v| v.as_str()));
+        let text = mail::read(&record, &secret, uid, offset, false, mailbox).await?;
         let text = match text.char_indices().nth(max) {
             Some((i, _)) => format!("{}\n… (cut at {max} characters)", &text[..i]),
             None => text,

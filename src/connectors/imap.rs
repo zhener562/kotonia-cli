@@ -193,6 +193,88 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ImapSession<S> {
         let _ = self.command("LOGOUT").await;
     }
 
+    /// Find the mailbox flagged `\All` (Gmail's "All Mail", whose visible
+    /// name is localised — e.g. `[Gmail]/すべてのメール` in modified UTF-7).
+    pub async fn all_mail_mailbox(&mut self) -> Result<Option<String>, ImapError> {
+        let lines = self.command("LIST \"\" \"*\"").await?;
+        Ok(lines
+            .iter()
+            .find(|u| u.text.starts_with("* LIST") && u.text.contains("\\All"))
+            .and_then(|u| list_mailbox_name(&u.text)))
+    }
+
+    /// Full-text search with a UTF-8 query sent as a literal (Japanese
+    /// cannot go in a quoted string). On Gmail this is `X-GM-RAW`, i.e. the
+    /// same query language as the Gmail search box; elsewhere `TEXT`.
+    pub async fn uid_search_query(
+        &mut self,
+        query: &str,
+        gmail: bool,
+    ) -> Result<Vec<u32>, ImapError> {
+        let key = if gmail { "X-GM-RAW" } else { "TEXT" };
+        let lines = self
+            .command_literal(
+                &format!("UID SEARCH CHARSET UTF-8 {key}"),
+                query.as_bytes(),
+                "",
+            )
+            .await?;
+        let mut uids = Vec::new();
+        for u in &lines {
+            if let Some(rest) = u.text.strip_prefix("* SEARCH") {
+                uids.extend(
+                    rest.split_whitespace()
+                        .filter_map(|n| n.parse::<u32>().ok()),
+                );
+            }
+        }
+        uids.sort_unstable();
+        uids.dedup();
+        Ok(uids)
+    }
+
+    /// A command with one synchronising literal: send `prefix {n}`, wait for
+    /// the server's `+` go-ahead, then the bytes and the rest of the line.
+    async fn command_literal(
+        &mut self,
+        prefix: &str,
+        literal: &[u8],
+        suffix: &str,
+    ) -> Result<Vec<Untagged>, ImapError> {
+        self.tag += 1;
+        let tag = format!("k{}", self.tag);
+        let head = format!("{tag} {prefix} {{{}}}\r\n", literal.len());
+        self.write(head.as_bytes()).await?;
+        let go = self.read_line().await?;
+        if !go.starts_with('+') {
+            return Err(ImapError::Protocol(format!(
+                "server refused the literal: {go}"
+            )));
+        }
+        let mut rest = literal.to_vec();
+        rest.extend_from_slice(suffix.as_bytes());
+        rest.extend_from_slice(b"\r\n");
+        self.write(&rest).await?;
+        let mut untagged = Vec::new();
+        loop {
+            let resp = self.read_response().await?;
+            if let Some(r) = resp.text.strip_prefix(&format!("{tag} ")) {
+                if r.starts_with("OK") {
+                    return Ok(untagged);
+                }
+                return Err(ImapError::Protocol(r.to_string()));
+            }
+            untagged.push(resp);
+        }
+    }
+
+    async fn write(&mut self, bytes: &[u8]) -> Result<(), ImapError> {
+        tokio::time::timeout(IO_TIMEOUT, self.stream.get_mut().write_all(bytes))
+            .await
+            .map_err(|_| ImapError::Protocol("write timed out".into()))?
+            .map_err(|e| ImapError::Protocol(format!("write: {e}")))
+    }
+
     async fn command(&mut self, cmd: &str) -> Result<Vec<Untagged>, ImapError> {
         self.tag += 1;
         let tag = format!("k{}", self.tag);
@@ -276,6 +358,23 @@ pub fn quote(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+/// The mailbox name at the end of a `* LIST (flags) "/" name` line, quoted
+/// or not. Returned unquoted (and still in modified UTF-7, which is what
+/// EXAMINE wants back).
+pub fn list_mailbox_name(line: &str) -> Option<String> {
+    let t = line.trim_end();
+    if let Some(stripped) = t.strip_suffix('"') {
+        let start = stripped.rfind(" \"")? + 2;
+        Some(
+            stripped[start..]
+                .replace("\\\"", "\"")
+                .replace("\\\\", "\\"),
+        )
+    } else {
+        t.rsplit(' ').next().map(str::to_string)
+    }
 }
 
 fn trailing_literal_len(line: &str) -> Option<usize> {
@@ -384,6 +483,51 @@ mod tests {
             .iter()
             .all(|c| !c.starts_with("SELECT") && !c.contains("STORE")));
         assert!(seen[0].contains(r#""p\"w""#));
+    }
+
+    #[tokio::test]
+    async fn japanese_search_goes_as_a_literal_and_all_mail_is_found() {
+        let (client, server) = tokio::io::duplex(8192);
+        let q = "PC 修理";
+        let n = q.len();
+        let script = vec![
+            (
+                "LIST \"\" \"*\"",
+                b"* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n* LIST (\\All \\HasNoChildren) \"/\" \"[Gmail]/&MFkweTBmMG4w4TD8MOs-\"\r\nTAG OK\r\n".to_vec(),
+            ),
+            (
+                // The literal head: the server must answer `+` before the bytes.
+                "UID SEARCH CHARSET UTF-8 X-GM-RAW {",
+                b"+ go ahead\r\n".to_vec(),
+            ),
+        ];
+        let server = tokio::spawn(async move {
+            let seen = fake_server(server, script).await;
+            seen
+        });
+        let mut s = ImapSession::over(client).await.unwrap();
+        let all = s.all_mail_mailbox().await.unwrap();
+        assert_eq!(all.as_deref(), Some("[Gmail]/&MFkweTBmMG4w4TD8MOs-"));
+        // Second half of the exchange is driven by hand below.
+        let search = tokio::spawn(async move {
+            let r = s.uid_search_query(q, true).await;
+            (s, r)
+        });
+        let seen = server.await.unwrap();
+        assert!(seen[1].ends_with(&format!("{{{n}}}")), "{}", seen[1]);
+        drop(search);
+    }
+
+    #[test]
+    fn list_names() {
+        assert_eq!(
+            list_mailbox_name(r#"* LIST (\All) "/" "[Gmail]/All Mail""#).as_deref(),
+            Some("[Gmail]/All Mail")
+        );
+        assert_eq!(
+            list_mailbox_name(r#"* LIST () "/" INBOX"#).as_deref(),
+            Some("INBOX")
+        );
     }
 
     #[tokio::test]

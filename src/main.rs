@@ -181,6 +181,15 @@ enum MailCmd {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Search like the mail client's search box (Gmail syntax on Gmail,
+    /// archived mail included). Read hits with `mail read <uid> --all`.
+    Search {
+        query: Vec<String>,
+        #[arg(long)]
+        connector: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
     /// Print one message.
     Read {
         uid: u32,
@@ -191,6 +200,9 @@ enum MailCmd {
         /// Show the MIME structure instead of the text.
         #[arg(long)]
         parts: bool,
+        /// The uid came from `mail search` (Gmail's All Mail).
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -931,15 +943,43 @@ async fn run_mail(args: MailArgs) -> ExitCode {
                 let items = connectors::mail::recent(&rec, &secret, window, limit).await?;
                 Ok(connectors::mail::format_summaries(&items, offset))
             }
+            MailCmd::Search {
+                query,
+                connector,
+                limit,
+            } => {
+                let rec = find_connector(&registry, connector.as_deref(), true)?;
+                let secret = connector_secret(&rec.id)?;
+                let (mailbox, items) =
+                    connectors::mail::search(&rec, &secret, &query.join(" "), limit).await?;
+                Ok(format!(
+                    "(mailbox: {mailbox}, {} result(s))\n{}",
+                    items.len(),
+                    connectors::mail::format_summaries(&items, offset)
+                ))
+            }
             MailCmd::Read {
                 uid,
                 connector,
                 max_chars,
                 parts,
+                all,
             } => {
                 let rec = find_connector(&registry, connector.as_deref(), true)?;
                 let secret = connector_secret(&rec.id)?;
-                let text = connectors::mail::read(&rec, &secret, uid, offset, parts).await?;
+                let text = connectors::mail::read(
+                    &rec,
+                    &secret,
+                    uid,
+                    offset,
+                    parts,
+                    if all {
+                        connectors::mail::Mailbox::All
+                    } else {
+                        connectors::mail::Mailbox::Inbox
+                    },
+                )
+                .await?;
                 let text = match text.char_indices().nth(max_chars) {
                     Some((i, _)) => format!("{}\n… (cut at {max_chars} characters)", &text[..i]),
                     None => text,

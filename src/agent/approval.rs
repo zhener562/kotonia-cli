@@ -47,9 +47,24 @@ pub enum Decision {
     Allow,
     /// Surface to the operator and wait for y/N.
     AskUser { reason: String },
+    /// Never run, and do not ask: no answer from the operator makes it OK.
+    Refuse { reason: String },
 }
 
 pub fn decide(mode: ApprovalMode, command: &str) -> Decision {
+    // The secret vault is for kotonia-cli's own code (mail tools, connector
+    // checks). An agent that reads it holds the user's passwords in its
+    // context, so this is refused in every mode — including `auto`, and
+    // without offering an approval the user might click through. It did
+    // happen: asked to find older mail, the agent wrote its own IMAP client
+    // and logged in with the app password from the vault (2026-11-01).
+    if crate::vault::command_touches_vault(command) {
+        return Decision::Refuse {
+            reason: "the secret vault is off-limits to the agent; use the mail_* tools or \
+                     request_connector instead"
+                .to_string(),
+        };
+    }
     match mode {
         ApprovalMode::Auto => Decision::Allow,
         ApprovalMode::All => Decision::AskUser {
@@ -199,9 +214,6 @@ fn dangerous_reason(segment: &str) -> Option<String> {
         if lower.contains(&n) {
             return Some((*label).to_string());
         }
-    }
-    if crate::vault::command_touches_vault(s) {
-        return Some("touches the secret vault".to_string());
     }
     if lower.starts_with("rm ") && !is_safe_rm(s) {
         return Some("rm without an explicit safe target".to_string());
@@ -406,15 +418,23 @@ mod tests {
     }
 
     #[test]
-    fn reading_the_vault_needs_a_human_even_for_safe_leaders() {
-        assert!(ask(decide(
+    fn the_vault_is_refused_in_every_mode_without_asking() {
+        let refused = |d: Decision| matches!(d, Decision::Refuse { .. });
+        for mode in [
             ApprovalMode::Allowlist,
-            "cat ~/.kotonia/vault/imap.gmail"
-        )));
-        assert!(ask(decide(
-            ApprovalMode::Allowlist,
-            "ls ~/.kotonia/home && cat $HOME/.kotonia/vault/x"
-        )));
+            ApprovalMode::All,
+            ApprovalMode::Auto,
+        ] {
+            assert!(refused(decide(mode, "cat ~/.kotonia/vault/imap.gmail")));
+            assert!(refused(decide(
+                mode,
+                "ls ~/.kotonia/home && cat $HOME/.kotonia/vault/x"
+            )));
+            assert!(refused(decide(
+                mode,
+                "python3 -c \"open(os.path.expanduser('~/.kotonia/vault/g')).read()\""
+            )));
+        }
         assert_eq!(
             decide(ApprovalMode::Allowlist, "cat ~/.kotonia/home/MEMORY.md"),
             Decision::Allow
