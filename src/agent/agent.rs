@@ -163,6 +163,12 @@ pub struct AgentConfig {
     /// mail / an API key mid-conversation). On for the resident `home`
     /// agent; off for plain coding sessions, where it is noise.
     pub connectors: bool,
+    /// Nobody is watching this run (the heartbeat). Network tools that are
+    /// otherwise trusted — `fetch_url`, `web_search` — go through the
+    /// approval handler too, so text read during the run cannot make the
+    /// agent carry data out in a URL or query. Under allowlist, `curl` and
+    /// `wget` were already gated; this closes the same door for the tools.
+    pub unattended: bool,
 }
 
 impl AgentConfig {
@@ -176,6 +182,7 @@ impl AgentConfig {
             force_delimiter: false,
             persona_prefix: None,
             connectors: false,
+            unattended: false,
         }
     }
 }
@@ -925,6 +932,33 @@ impl Agent {
         }
     }
 
+    /// In an unattended run, ask before any network tool. Returns the
+    /// observation to hand back when the handler said no.
+    fn gate_unattended_network(
+        &self,
+        command: &str,
+        approval: &mut dyn ApprovalHandler,
+        sink: &mut dyn EventSink,
+    ) -> Option<(String, bool)> {
+        if !self.config.unattended {
+            return None;
+        }
+        let reason = "network tool during an unattended run";
+        if approval.ask(command, reason) == ApprovalOutcome::Approve {
+            return None;
+        }
+        sink.emit(Event::BashSkipped {
+            command: command.to_string(),
+            reason: reason.to_string(),
+        });
+        Some((
+            "Not allowed: nobody is here to approve network access during this background \
+run. If the check really needs the web, say so in your message to the user."
+                .to_string(),
+            true,
+        ))
+    }
+
     /// Execute a tool call. Returns `(observation_text, is_error)` so the
     /// native loop can package the result as a `ToolResult` block.
     ///
@@ -1009,6 +1043,9 @@ impl Agent {
                 // adversarial query can't break out of the argument.
                 let escaped = shell_single_quote(&query);
                 let command = format!("web-search {escaped} {max_results}");
+                if let Some(denied) = self.gate_unattended_network(&command, approval, sink) {
+                    return Ok(denied);
+                }
                 sink.emit(Event::Bash {
                     command: command.clone(),
                 });
@@ -1048,6 +1085,9 @@ impl Agent {
                 } else {
                     format!("fetch-url {escaped}")
                 };
+                if let Some(denied) = self.gate_unattended_network(&command, approval, sink) {
+                    return Ok(denied);
+                }
                 sink.emit(Event::Bash {
                     command: command.clone(),
                 });

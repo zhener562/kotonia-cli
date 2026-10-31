@@ -202,6 +202,7 @@ async fn run_heartbeat(
     // The tool is advertised so the model knows connecting exists, but the
     // headless handler answers "nobody here" — a heartbeat never prompts.
     config.connectors = true;
+    config.unattended = true;
     let exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| "kotonia-cli".to_string());
@@ -263,6 +264,9 @@ async fn run_heartbeat(
             offset,
         ),
         Ok(Ok(answer)) => {
+            // The model sometimes writes the quiet word *and* a note; the
+            // note is the message, the word is noise to the user.
+            let answer = answer.replace(&quiet, "");
             delivery
                 .deliver(
                     FeedItem {
