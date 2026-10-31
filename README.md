@@ -24,6 +24,15 @@ kotonia-cli
 
 ## Install
 
+Prebuilt binaries for Linux (x64 / arm64), macOS (Apple Silicon) and
+Windows (x64) are on the
+[Releases page](https://github.com/zhener562/kotonia-cli/releases/latest):
+download the archive for your platform, extract `kotonia-cli`
+(`kotonia-cli.exe` on Windows) and put it somewhere on your `PATH`.
+Under WSL, use the Linux build.
+
+Or build from source:
+
 ```sh
 git clone https://github.com/zhener562/kotonia-cli
 cd kotonia-cli
@@ -242,6 +251,25 @@ The tool catalogue is intentionally tiny:
 - **`web_search(query, max_results=5)`** — Searxng SERP preview.
 - **`fetch_url(url, max_chars?)`** — main-article extraction via
   `trafilatura`, returned as Markdown.
+
+## Telemetry
+
+When you are logged in to kotonia.ai (`kotonia-cli login`, or
+`KOTONIA_API_KEY` is set), each agent run sends two small events — `start`
+and `end` — to the kotonia.ai server only, so we can see where runs fail
+before they ever reach a model (no `claude` binary, missing API key,
+worktree trouble). Requests to kotonia.ai also carry an
+`x-kotonia-client` header like `cli/0.1.11 (linux-x86_64; wsl)`.
+
+What is sent: a random per-run id, the engine (`react` / `claude-code`),
+whether the model is kotonia's, how the run was driven (one-shot / REPL /
+pipe / serve), the outcome, a fixed failure label (e.g. `claude_spawn`,
+`llm_auth`), the duration, and the version / OS / WSL from the header.
+**Never** prompts, replies, file paths or error text. Third-party
+providers (OpenAI, DeepSeek, …) never receive the header. See
+[`src/telemetry.rs`](src/telemetry.rs).
+
+Turn it off with `DO_NOT_TRACK=1` or `KOTONIA_TELEMETRY=0`.
 
 ## License
 

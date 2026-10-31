@@ -8,6 +8,7 @@
 
 pub mod agent;
 pub mod ai;
+pub mod client_info;
 pub mod config;
 pub mod daemon;
 pub mod execution;
@@ -15,3 +16,4 @@ pub mod login;
 pub mod notifier;
 pub mod providers;
 pub mod serve;
+pub mod telemetry;

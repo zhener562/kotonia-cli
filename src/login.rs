@@ -40,7 +40,12 @@ pub enum PollOutcome {
 struct EmptyBody {}
 
 fn http_client() -> Result<reqwest::Client, String> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Ok(value) = reqwest::header::HeaderValue::from_str(crate::client_info::header_value()) {
+        headers.insert(crate::client_info::HEADER, value);
+    }
     reqwest::Client::builder()
+        .default_headers(headers)
         .timeout(Duration::from_secs(15))
         .build()
         .map_err(|e| format!("http client: {e}"))

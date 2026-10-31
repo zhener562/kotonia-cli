@@ -41,6 +41,7 @@ use kotonia_cli::daemon::{self, DaemonConfig};
 use kotonia_cli::login;
 use kotonia_cli::notifier;
 use kotonia_cli::serve;
+use kotonia_cli::telemetry;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -263,6 +264,13 @@ struct RunArgs {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    let code = real_main().await;
+    // No-op unless an agent run started telemetry (see `telemetry`).
+    telemetry::finish(code == ExitCode::SUCCESS).await;
+    code
+}
+
+async fn real_main() -> ExitCode {
     // Propagate the paired device_token into KOTONIA_API_KEY so (a) the
     // one-shot/REPL run path's `kotonia_api_base` gate below (which only
     // checks the env var) actually fires for a plain `kotonia-cli login`
@@ -300,6 +308,16 @@ async fn main() -> ExitCode {
         return print_sessions_and_exit();
     }
 
+    if cli.serve {
+        kotonia_cli::client_info::set_mode("serve");
+    }
+    let engine_label = if cli.model == "claude-code" {
+        "claude-code"
+    } else {
+        cli.engine.as_str()
+    };
+    telemetry::start(engine_label, &cli.model);
+
     let approval_mode = match ApprovalMode::parse(&cli.approval) {
         Some(m) => m,
         None => {
@@ -307,6 +325,7 @@ async fn main() -> ExitCode {
                 "kotonia-cli: unknown approval mode `{}` (expected all|allowlist|auto)",
                 cli.approval
             );
+            telemetry::fail("bad_args");
             return ExitCode::from(2);
         }
     };
@@ -322,6 +341,7 @@ async fn main() -> ExitCode {
             "kotonia-cli: unknown engine `{}` (expected react|claude-code)",
             cli.engine
         );
+        telemetry::fail("bad_args");
         return ExitCode::from(2);
     };
 
@@ -329,6 +349,7 @@ async fn main() -> ExitCode {
         Ok(p) => p,
         Err(e) => {
             eprintln!("kotonia-cli: cannot read cwd: {e}");
+            telemetry::fail("cwd");
             return ExitCode::from(1);
         }
     };
@@ -368,6 +389,7 @@ async fn main() -> ExitCode {
                     Err(e) => {
                         eprintln!("kotonia-cli: failed to create worktree: {e}");
                         eprintln!("   (hint: pass --in-place to operate on the cwd directly)");
+                        telemetry::fail("worktree");
                         return ExitCode::from(1);
                     }
                 }
@@ -379,6 +401,7 @@ async fn main() -> ExitCode {
             Err(e) => {
                 eprintln!("kotonia-cli: failed to create worktree: {e}");
                 eprintln!("   (hint: pass --in-place to operate on the cwd directly)");
+                telemetry::fail("worktree");
                 return ExitCode::from(1);
             }
         }
@@ -397,6 +420,7 @@ async fn main() -> ExitCode {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("kotonia-cli: cannot use model `{}`: {e}", cli.model);
+                    telemetry::fail("provider");
                     return ExitCode::from(2);
                 }
             };
@@ -454,6 +478,7 @@ async fn main() -> ExitCode {
                             }
                             Err(e) => {
                                 eprintln!("kotonia-cli: cannot resume `{id}`: {e}");
+                                telemetry::fail("resume");
                                 return ExitCode::from(1);
                             }
                         }
@@ -472,6 +497,7 @@ async fn main() -> ExitCode {
     // stdin. Only the ReAct engine exposes the event/approval surface the
     // protocol needs; claude-code runs its own tool loop, so reject it here.
     if cli.serve {
+        telemetry::set_mode("serve");
         match agent {
             DispatchAgent::ReAct(react_agent) => {
                 let hello = serve::HelloInfo {
@@ -502,6 +528,7 @@ async fn main() -> ExitCode {
                     "kotonia-cli: --serve is only supported with the `react` engine \
                      (not claude-code)"
                 );
+                telemetry::fail("bad_args");
                 cleanup_workspace(workspace, cli.keep_worktree, cli.quiet_shutdown).await;
                 return ExitCode::from(2);
             }
@@ -516,14 +543,17 @@ async fn main() -> ExitCode {
 
     let outcome = if let Some(task) = cli.prompt.clone() {
         // One-shot.
+        telemetry::set_mode("oneshot");
         agent
             .run_turn(&task, &mut approval_handler, &mut sink)
             .await
     } else if interactive {
         // REPL mode.
+        telemetry::set_mode("repl");
         repl(&mut agent, &mut approval_handler, &mut sink).await
     } else {
         // Pipe / non-TTY stdin: treat the entire stdin as a single prompt.
+        telemetry::set_mode("pipe");
         match read_stdin_to_end() {
             Ok(task) if !task.trim().is_empty() => {
                 agent
@@ -532,6 +562,7 @@ async fn main() -> ExitCode {
             }
             _ => {
                 eprintln!("kotonia-cli: no prompt (pass as argument or pipe via stdin)");
+                telemetry::fail("no_prompt");
                 cleanup_workspace(workspace, cli.keep_worktree, cli.quiet_shutdown).await;
                 return ExitCode::from(2);
             }
@@ -542,6 +573,7 @@ async fn main() -> ExitCode {
         Ok(_) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("\nkotonia-cli: {e}");
+            telemetry::fail(telemetry::failure_kind(&e));
             ExitCode::from(1)
         }
     };
@@ -911,6 +943,10 @@ async fn validate_device_auth(cfg: &daemon_config::DaemonStoredConfig) -> Result
     let response = client
         .get(url)
         .bearer_auth(&cfg.device_token)
+        .header(
+            kotonia_cli::client_info::HEADER,
+            kotonia_cli::client_info::header_value(),
+        )
         .send()
         .await
         .map_err(|e| format!("auth status request: {e}"))?;

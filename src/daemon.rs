@@ -386,6 +386,11 @@ async fn connect_and_pump(
         AUTHORIZATION,
         HeaderValue::from_str(bearer).map_err(|e| format!("bearer header: {e}"))?,
     );
+    if let Ok(client) = HeaderValue::from_str(crate::client_info::header_value()) {
+        request
+            .headers_mut()
+            .insert(crate::client_info::HEADER, client);
+    }
 
     let (ws_stream, _resp) = tokio_tungstenite::connect_async(request)
         .await

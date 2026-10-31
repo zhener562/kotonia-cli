@@ -252,7 +252,10 @@ fn kotonia_builtin() -> ProviderSpec {
         default_model: "kotonia-llm-basic".into(),
         max_tokens_param: MaxTokensParam::MaxTokens,
         max_tokens_cap: None,
-        extra_headers: Vec::new(),
+        extra_headers: vec![(
+            crate::client_info::HEADER.to_string(),
+            crate::client_info::header_value().to_string(),
+        )],
         extra_body_base: Map::new(),
         hook: ProviderHook::Kotonia,
     }
