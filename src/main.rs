@@ -1054,13 +1054,11 @@ async fn run_home(args: HomeArgs) -> ExitCode {
             }
         }),
         HomeCmd::Prompt => {
-            println!(
-                "{}",
-                home.prompt_block(
-                    home_workspace::DEFAULT_MAX_FILE_CHARS,
-                    home_workspace::DEFAULT_MAX_TOTAL_CHARS
-                )
-            );
+            // Exactly what `--home` and the heartbeat prepend.
+            match home_prompt_prefix(true) {
+                Ok(p) => println!("{}", p.unwrap_or_default()),
+                Err(e) => eprintln!("{e}"),
+            }
             Ok(())
         }
         HomeCmd::Heartbeat { every, off } => load().and_then(|mut s| {
