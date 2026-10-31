@@ -805,18 +805,7 @@ fn home_prompt_prefix(enabled: bool) -> Result<Option<String>, String> {
             home.root().display()
         ));
     }
-    let mut block = home.prompt_block(
-        home_workspace::DEFAULT_MAX_FILE_CHARS,
-        home_workspace::DEFAULT_MAX_TOTAL_CHARS,
-    );
-    block.push_str(&connectors::prompt_section(&self_exe()));
-    Ok(Some(block))
-}
-
-fn self_exe() -> String {
-    std::env::current_exe()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "kotonia-cli".to_string())
+    Ok(Some(kotonia_cli::home::conversation_prefix(&home)))
 }
 
 fn find_connector(

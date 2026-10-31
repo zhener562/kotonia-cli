@@ -275,6 +275,7 @@ impl Agent {
             let mut tools = build_tool_catalog();
             if config.connectors {
                 tools.push(request_connector_tool());
+                tools.extend(mail_tools());
             }
             tools
         } else {
@@ -1260,6 +1261,30 @@ If the check really needs it, say so in your message to the user."
                     }
                 }
             }
+            "mail_recent" | "mail_read" if self.config.connectors => {
+                let connector = input.get("connector").and_then(|v| v.as_str());
+                let label = format!("{name} {input}");
+                sink.emit(Event::Bash {
+                    command: label.clone(),
+                });
+                let text = match run_mail_tool(name, input, connector).await {
+                    Ok(t) => t,
+                    Err(e) => format!("[error] {e}"),
+                };
+                let is_error = text.starts_with("[error]");
+                let result = crate::execution::host::ExecutionResult {
+                    exit_code: if is_error { 1 } else { 0 },
+                    timed_out: false,
+                    truncated: false,
+                    combined: crate::vault::redact(&text),
+                    full_output_path: None,
+                };
+                sink.emit(Event::Observation {
+                    result: result.clone(),
+                });
+                self.history_append_observation(&result);
+                Ok((result.as_observation(), is_error))
+            }
             "request_connector" if self.config.connectors => {
                 let raw_kind = input
                     .get("connector")
@@ -1550,6 +1575,97 @@ fn build_tool_catalog() -> Vec<AiTool> {
             }),
         },
     ]
+}
+
+fn mail_tools() -> Vec<AiTool> {
+    vec![
+        AiTool {
+            name: "mail_recent".to_string(),
+            description: "List the newest messages in a connected mailbox's INBOX (read-only; \
+                          nothing is marked as read). Returns uid, date, sender, subject and \
+                          a snippet, fenced as untrusted content."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "new": {"type": "boolean", "description": "Only messages that arrived since the previous `new: true` call."},
+                    "days": {"type": "integer", "description": "Look back this many days (default 2). Ignored when `new` is true."},
+                    "limit": {"type": "integer", "description": "Max messages, default 20."},
+                    "connector": {"type": "string", "description": "Connector id; default the first mail connector."}
+                }
+            }),
+        },
+        AiTool {
+            name: "mail_read".to_string(),
+            description: "Read one message's text by uid (read-only), fenced as untrusted content."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "uid": {"type": "integer"},
+                    "max_chars": {"type": "integer", "description": "Default 12000."},
+                    "connector": {"type": "string"}
+                },
+                "required": ["uid"]
+            }),
+        },
+    ]
+}
+
+async fn run_mail_tool(
+    name: &str,
+    input: &serde_json::Value,
+    connector: Option<&str>,
+) -> Result<String, String> {
+    use crate::connectors::{mail, Registry};
+    let registry = Registry::load()?;
+    let record = match connector {
+        Some(id) => registry.connectors.get(id).cloned(),
+        None => registry.first_mail().cloned(),
+    }
+    .ok_or_else(|| {
+        "no mail account is connected — call request_connector with connector \"gmail\" \
+         (or \"icloud\" / \"imap\") if you need one"
+            .to_string()
+    })?;
+    let secret = crate::vault::Vault::resolve()?
+        .get(&record.id)?
+        .ok_or_else(|| {
+            format!(
+                "the password for `{}` is missing; ask the user to reconnect",
+                record.id
+            )
+        })?;
+    let offset = *chrono::Local::now().offset();
+    if name == "mail_recent" {
+        let window = if input.get("new").and_then(|v| v.as_bool()).unwrap_or(false) {
+            mail::Window::New
+        } else {
+            mail::Window::SinceDays(input.get("days").and_then(|v| v.as_i64()).unwrap_or(2))
+        };
+        let limit = input
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(20)
+            .clamp(1, 50) as usize;
+        let items = mail::recent(&record, &secret, window, limit).await?;
+        Ok(mail::format_summaries(&items, offset))
+    } else {
+        let uid = input
+            .get("uid")
+            .and_then(|v| v.as_u64())
+            .ok_or("mail_read needs `uid`")? as u32;
+        let max = input
+            .get("max_chars")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(12_000) as usize;
+        let text = mail::read(&record, &secret, uid, offset, false).await?;
+        let text = match text.char_indices().nth(max) {
+            Some((i, _)) => format!("{}\n… (cut at {max} characters)", &text[..i]),
+            None => text,
+        };
+        Ok(mail::wrap_untrusted(&text))
+    }
 }
 
 fn request_connector_tool() -> AiTool {

@@ -203,15 +203,7 @@ async fn run_heartbeat(
     // headless handler answers "nobody here" — a heartbeat never prompts.
     config.connectors = true;
     config.unattended = true;
-    let exe = std::env::current_exe()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "kotonia-cli".to_string());
-    let mut prefix = home.prompt_block(
-        super::workspace::DEFAULT_MAX_FILE_CHARS,
-        super::workspace::DEFAULT_MAX_TOTAL_CHARS,
-    );
-    prefix.push_str(&crate::connectors::prompt_section(&exe));
-    config.persona_prefix = Some(prefix);
+    config.persona_prefix = Some(super::conversation_prefix(home));
     config.kotonia_api_base = std::env::var("KOTONIA_API_KEY").ok().map(|_| {
         std::env::var("KOTONIA_API_BASE").unwrap_or_else(|_| "https://kotonia.ai".to_string())
     });
@@ -298,8 +290,18 @@ pub async fn run_forever(
     cfg: RunnerConfig,
     notifier: Option<Arc<dyn Notifier>>,
 ) -> Result<(), String> {
-    let _lock = RunnerLock::acquire(&home)?;
     let delivery = Delivery::new(home.clone(), notifier, true);
+    run_forever_with(home, cfg, delivery).await
+}
+
+/// [`run_forever`] with a caller-built [`Delivery`] — kotonia-desktop adds
+/// an observer so feed items reach its window as they happen.
+pub async fn run_forever_with(
+    home: HomeDir,
+    cfg: RunnerConfig,
+    delivery: Delivery,
+) -> Result<(), String> {
+    let _lock = RunnerLock::acquire(&home)?;
     let mut sleep = SleepDetector::new();
     eprintln!(
         "[home] running in {} (poll every {}s, model {})",

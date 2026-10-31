@@ -12,3 +12,15 @@ pub mod heartbeat;
 pub mod runner;
 pub mod schedule;
 pub mod workspace;
+
+/// Everything a conversation with the resident agent starts with: the
+/// memory files, then web access and connectors. Shared by `--home`, the
+/// heartbeat and kotonia-desktop's home mode so they cannot drift apart.
+pub fn conversation_prefix(home: &workspace::HomeDir) -> String {
+    let mut block = home.prompt_block(
+        workspace::DEFAULT_MAX_FILE_CHARS,
+        workspace::DEFAULT_MAX_TOTAL_CHARS,
+    );
+    block.push_str(&crate::connectors::prompt_section());
+    block
+}

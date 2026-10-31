@@ -30,11 +30,14 @@ pub struct FeedItem {
     pub text: String,
 }
 
+pub type FeedObserver = Arc<dyn Fn(&FeedItem) + Send + Sync>;
+
 pub struct Delivery {
     home: HomeDir,
     notifier: Option<Arc<dyn Notifier>>,
     /// Print to stdout as well (the `home run` foreground UX).
     echo: bool,
+    observer: Option<FeedObserver>,
 }
 
 impl Delivery {
@@ -43,7 +46,14 @@ impl Delivery {
             home,
             notifier,
             echo,
+            observer: None,
         }
+    }
+
+    /// Also hand every recorded item to `observer` (a UI).
+    pub fn with_observer(mut self, observer: FeedObserver) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     /// Record only — no push. For entries the user should be able to find
@@ -65,6 +75,9 @@ impl Delivery {
         if let Err(e) = res {
             eprintln!("[home] cannot write feed {}: {e}", path.display());
         }
+        if let Some(o) = &self.observer {
+            o(item);
+        }
         if self.echo {
             let local = item.ts.with_timezone(&offset).format("%m-%d %H:%M");
             println!("[{local}] {:?}: {}", item.kind, item.text);
@@ -80,4 +93,31 @@ impl Delivery {
             }
         }
     }
+}
+
+/// The newest `limit` feed items across the daily files, newest first.
+pub fn recent(home: &HomeDir, limit: usize) -> Vec<FeedItem> {
+    let dir = home.root().join("feed");
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+        .unwrap_or_default();
+    files.retain(|p| p.extension().is_some_and(|x| x == "jsonl"));
+    files.sort();
+    let mut out = Vec::new();
+    for f in files.iter().rev() {
+        let Ok(raw) = std::fs::read_to_string(f) else {
+            continue;
+        };
+        let mut day: Vec<FeedItem> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        day.reverse();
+        out.extend(day);
+        if out.len() >= limit {
+            break;
+        }
+    }
+    out.truncate(limit);
+    out
 }
