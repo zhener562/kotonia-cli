@@ -199,10 +199,18 @@ async fn run_heartbeat(
     // the world waits for a human who is not here.
     let mut config = AgentConfig::new(ApprovalMode::Allowlist, true);
     config.max_iterations = cfg.max_iterations;
-    config.persona_prefix = Some(home.prompt_block(
+    // The tool is advertised so the model knows connecting exists, but the
+    // headless handler answers "nobody here" — a heartbeat never prompts.
+    config.connectors = true;
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "kotonia-cli".to_string());
+    let mut prefix = home.prompt_block(
         super::workspace::DEFAULT_MAX_FILE_CHARS,
         super::workspace::DEFAULT_MAX_TOTAL_CHARS,
-    ));
+    );
+    prefix.push_str(&crate::connectors::prompt_section(&exe));
+    config.persona_prefix = Some(prefix);
     config.kotonia_api_base = std::env::var("KOTONIA_API_KEY").ok().map(|_| {
         std::env::var("KOTONIA_API_BASE").unwrap_or_else(|_| "https://kotonia.ai".to_string())
     });

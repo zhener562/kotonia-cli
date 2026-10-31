@@ -200,6 +200,9 @@ fn dangerous_reason(segment: &str) -> Option<String> {
             return Some((*label).to_string());
         }
     }
+    if crate::vault::command_touches_vault(s) {
+        return Some("touches the secret vault".to_string());
+    }
     if lower.starts_with("rm ") && !is_safe_rm(s) {
         return Some("rm without an explicit safe target".to_string());
     }
@@ -222,6 +225,21 @@ fn is_safe_rm(s: &str) -> bool {
 }
 
 fn is_known_safe(segment: &str, leader: &str) -> bool {
+    // kotonia-cli's own read-only subcommands. `mail` only ever EXAMINEs and
+    // PEEKs; `connector list` prints names. `secret run` is NOT here — it
+    // runs an arbitrary command with a key in its environment.
+    if leader == "kotonia-cli" || leader.ends_with("/kotonia-cli") {
+        let mut words = segment
+            .split_whitespace()
+            .skip_while(|w| *w != leader)
+            .skip(1);
+        return match (words.next(), words.next()) {
+            (Some("mail"), Some("recent" | "read")) => true,
+            (Some("connector"), Some("list")) => true,
+            (Some("home"), Some("list")) => true,
+            _ => false,
+        };
+    }
     // Single-word builtins / read-only inspection / standard build & test commands.
     const SAFE_LEADERS: &[&str] = &[
         // file & dir inspection
@@ -385,6 +403,35 @@ mod tests {
 
     fn ask(d: Decision) -> bool {
         matches!(d, Decision::AskUser { .. })
+    }
+
+    #[test]
+    fn reading_the_vault_needs_a_human_even_for_safe_leaders() {
+        assert!(ask(decide(
+            ApprovalMode::Allowlist,
+            "cat ~/.kotonia/vault/imap.gmail"
+        )));
+        assert!(ask(decide(
+            ApprovalMode::Allowlist,
+            "ls ~/.kotonia/home && cat $HOME/.kotonia/vault/x"
+        )));
+        assert_eq!(
+            decide(ApprovalMode::Allowlist, "cat ~/.kotonia/home/MEMORY.md"),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn own_read_only_subcommands_pass_but_secret_run_does_not() {
+        let allow = |c: &str| decide(ApprovalMode::Allowlist, c) == Decision::Allow;
+        assert!(allow("kotonia-cli mail recent --new"));
+        assert!(allow(
+            "/home/u/.cargo/bin/kotonia-cli mail read 4391 | head -50"
+        ));
+        assert!(allow("kotonia-cli connector list"));
+        assert!(!allow("kotonia-cli secret run k -- env"));
+        assert!(!allow("kotonia-cli connector remove gmail.x"));
+        assert!(!allow("kotonia-cli mail recent; rm -rf ~"));
     }
 
     #[test]

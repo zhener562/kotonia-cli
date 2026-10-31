@@ -406,6 +406,9 @@ impl HostExecutor {
             }
         };
 
+        // Scrub stored secrets before the output goes anywhere — the model,
+        // the UI, the session log, the full-output temp file.
+        let combined = crate::vault::redact(&combined);
         let exit_code = exit_status.code().unwrap_or(-1);
         let full_output_path = if shape_observation(&combined).elided {
             save_full_output(&combined)
@@ -497,6 +500,25 @@ fn append_capped(buf: &mut String, line: &str, truncated: &mut bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stored_secrets_never_reach_the_observation() {
+        let vault_dir = tempfile::tempdir().unwrap();
+        // Process-global, but only ever pointed at a throwaway dir: other
+        // tests that run commands just get an empty vault.
+        std::env::set_var("KOTONIA_VAULT_DIR", vault_dir.path());
+        crate::vault::Vault::new(vault_dir.path())
+            .set("t", "s3cr3t-value-xyz")
+            .unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let r = HostExecutor::new(cwd.path())
+            .bash("echo token=s3cr3t-value-xyz; echo s3cr3t-value-xyz >&2")
+            .await
+            .unwrap();
+        assert!(!r.combined.contains("s3cr3t-value-xyz"), "{}", r.combined);
+        assert!(!r.as_observation().contains("s3cr3t-value-xyz"));
+        assert_eq!(r.combined.matches(crate::vault::REDACTED).count(), 2);
+    }
 
     #[test]
     fn short_output_is_passed_through() {

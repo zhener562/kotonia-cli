@@ -241,6 +241,37 @@ kotonia-cli home tick --dry-run             # what would fire right now
 - One `home run` per home directory (file lock). Running it on two machines
   against the same account will double up; there is no cross-device lease yet.
 
+### Connectors (mail, API keys)
+
+The resident agent (`--home`, heartbeat) can ask for an account **in the
+conversation, at the moment it needs one**: it calls `request_connector`, and
+the terminal shows a one-screen card (what it is for, what connecting means, a
+link to create an app password) with a hidden prompt for the secret.
+
+```bash
+kotonia-cli connector add gmail          # same card, from the shell
+kotonia-cli connector list | check <id> | remove <id>
+kotonia-cli mail recent [--new | --days N] [--limit N]
+kotonia-cli mail read <uid>
+kotonia-cli secret run <id> -- 'curl -H "Authorization: Bearer $KOTONIA_TTS_API_KEY" …'
+```
+
+- Mail is IMAP over TLS, **read-only**: `EXAMINE` + `BODY.PEEK`, so nothing is
+  sent, deleted or marked as read. Gmail and iCloud need an app password.
+  Japanese charsets (ISO-2022-JP etc.) are decoded.
+- Secrets live in `~/.kotonia/vault/` (0600 files in a 0700 dir) and are typed
+  at a hidden prompt, never into the chat. Any stored secret that appears in a
+  command's output is replaced with `[redacted secret]` before the agent, the
+  UI or the session log sees it, and commands touching the vault path need
+  approval even in `allowlist` mode. This is exact-match redaction against a
+  shell agent running as you — a value transformed on the way out (base64 …)
+  is not caught.
+- Mail content is passed to the model between "untrusted content" markers, and
+  the prompt forbids acting on instructions found in it.
+- Cards are shown by the terminal REPL / one-shot only. `--serve` (VS Code),
+  the daemon and heartbeats answer "nobody can fill a card right now", and the
+  agent tells the user to run `connector add`.
+
 ### Approval modes
 
 `--approval` controls how `bash` commands are gated in the **ReAct**

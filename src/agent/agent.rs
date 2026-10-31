@@ -48,6 +48,23 @@ pub enum ApprovalOutcome {
 /// stdin; tests / web frontends can implement their own.
 pub trait ApprovalHandler: Send {
     fn ask(&mut self, command: &str, reason: &str) -> ApprovalOutcome;
+
+    /// Show a connector card (the agent asked for an account in the middle
+    /// of a turn) and collect what the user typed. Frontends that cannot
+    /// show one — or have nobody in front of them — keep the default.
+    fn request_connection(&mut self, _card: &crate::connectors::ConnectorCard) -> ConnectionReply {
+        ConnectionReply::Unavailable
+    }
+}
+
+/// Answer to [`ApprovalHandler::request_connection`].
+#[derive(Debug, Clone)]
+pub enum ConnectionReply {
+    /// Field key → value. Secret fields go to the vault, never to the model.
+    Provided(std::collections::BTreeMap<String, String>),
+    Declined,
+    /// No human, or a frontend that cannot render cards yet.
+    Unavailable,
 }
 
 /// Events the agent emits as it runs. The CLI renders these to stdout;
@@ -82,6 +99,12 @@ pub enum Event {
     /// Fires when the agent calls `inspect_image`. `error: None` on success
     /// (the image was loaded and attached to the next user turn); `Some(msg)`
     /// when the read failed (missing file, oversized, unsupported type).
+    /// The agent asked the user to connect an account (`request_connector`).
+    /// The card itself goes through `ApprovalHandler::request_connection`.
+    ConnectorRequested {
+        connector: String,
+        title: String,
+    },
     InspectImage {
         path: String,
         size_bytes: u64,
@@ -136,6 +159,10 @@ pub struct AgentConfig {
     /// the agent a voice / personality without forking the base prompt.
     /// Leave `None` for the plain CLI/daemon experience.
     pub persona_prefix: Option<String>,
+    /// Advertise the `request_connector` tool (asking the user to connect
+    /// mail / an API key mid-conversation). On for the resident `home`
+    /// agent; off for plain coding sessions, where it is noise.
+    pub connectors: bool,
 }
 
 impl AgentConfig {
@@ -148,6 +175,7 @@ impl AgentConfig {
             kotonia_api_base: None,
             force_delimiter: false,
             persona_prefix: None,
+            connectors: false,
         }
     }
 }
@@ -215,7 +243,11 @@ impl Agent {
         };
         let messages = vec![ChatMsg::system(system_prompt_text.clone())];
         let tool_catalog = if native_mode {
-            build_tool_catalog()
+            let mut tools = build_tool_catalog();
+            if config.connectors {
+                tools.push(request_connector_tool());
+            }
+            tools
         } else {
             Vec::new()
         };
@@ -1082,6 +1114,53 @@ impl Agent {
                     }
                 }
             }
+            "request_connector" if self.config.connectors => {
+                let raw_kind = input
+                    .get("connector")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let Some(kind) = crate::connectors::Catalog::parse(raw_kind) else {
+                    return Ok((
+                        format!(
+                            "Unknown connector `{raw_kind}`. Available: {}.",
+                            crate::connectors::Catalog::NAMES.join(", ")
+                        ),
+                        true,
+                    ));
+                };
+                let reason = input.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+                let card = crate::connectors::card_for(
+                    kind,
+                    reason,
+                    input.get("account").and_then(|v| v.as_str()),
+                    input.get("name").and_then(|v| v.as_str()),
+                );
+                sink.emit(Event::ConnectorRequested {
+                    connector: card.connector.clone(),
+                    title: card.title.clone(),
+                });
+                match approval.request_connection(&card) {
+                    ConnectionReply::Provided(values) => {
+                        match crate::connectors::connect_from_card(kind, &card, &values).await {
+                            Ok(c) => Ok((c.for_model(), !c.check.ok)),
+                            Err(e) => Ok((format!("Connecting failed: {e}"), true)),
+                        }
+                    }
+                    ConnectionReply::Declined => Ok((
+                        "The user declined to connect. Do not ask again in this turn; \
+                         carry on without it or explain what you could not do."
+                            .to_string(),
+                        true,
+                    )),
+                    ConnectionReply::Unavailable => Ok((
+                        "Nobody can fill a connector card right now (background run or a \
+                         frontend without cards). Tell the user what you need and that they \
+                         can connect it with `kotonia-cli connector add <kind>`."
+                            .to_string(),
+                        true,
+                    )),
+                }
+            }
             other => Ok((
                 format!(
                     "Unknown tool: `{other}`. Available tools: bash, web_search, \
@@ -1325,6 +1404,44 @@ fn build_tool_catalog() -> Vec<AiTool> {
             }),
         },
     ]
+}
+
+fn request_connector_tool() -> AiTool {
+    AiTool {
+        name: "request_connector".to_string(),
+        description: "Ask the user to connect an account you need right now. They \
+                      see a card with your reason and fill it in themselves; secrets \
+                      go to a local vault and are never shown to you. You get back \
+                      whether the test login worked. Use it at the moment you need \
+                      the account (not up front), and only for something listed \
+                      here. After connecting mail, read it with `kotonia-cli mail`."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "connector": {
+                    "type": "string",
+                    "enum": crate::connectors::Catalog::NAMES,
+                    "description": "gmail / icloud / imap (other mail) / api_key (one key \
+                                    for a service you will call yourself)"
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "One sentence, in the user's language: what you will \
+                                    use it for right now."
+                },
+                "account": {
+                    "type": "string",
+                    "description": "Email address to prefill, if you know it."
+                },
+                "name": {
+                    "type": "string",
+                    "description": "For api_key: the service name (e.g. \"Kotonia TTS\")."
+                }
+            },
+            "required": ["connector", "reason"]
+        }),
+    }
 }
 
 /// Best-effort one-line summary of an assistant turn for the legacy log.

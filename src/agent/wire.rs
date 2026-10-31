@@ -131,6 +131,11 @@ impl WireEvent {
                 size_bytes,
                 error,
             },
+            // No wire kind of its own: the backend drops kinds it does not
+            // know, and the daemon never enables connectors anyway.
+            Event::ConnectorRequested { title, .. } => Self::Text {
+                text: format!("(asked to connect: {title})"),
+            },
             Event::Final { answer } => Self::Final { answer },
             Event::Malformed { excerpt } => Self::Malformed { excerpt },
             Event::ContextCompacted {

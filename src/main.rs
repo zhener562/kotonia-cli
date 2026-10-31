@@ -25,7 +25,7 @@ use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 
 use kotonia_cli::agent::agent::{
-    Agent, AgentConfig, ApprovalHandler, ApprovalOutcome, Event, EventSink,
+    Agent, AgentConfig, ApprovalHandler, ApprovalOutcome, ConnectionReply, Event, EventSink,
 };
 use kotonia_cli::agent::approval::ApprovalMode;
 use kotonia_cli::agent::claude_code::ClaudeCodeAgent;
@@ -37,6 +37,7 @@ use kotonia_cli::agent::history::{
 use kotonia_cli::agent::provider::Provider;
 use kotonia_cli::agent::worktree::AgentWorkspace;
 use kotonia_cli::config as daemon_config;
+use kotonia_cli::connectors;
 use kotonia_cli::daemon::{self, DaemonConfig};
 use kotonia_cli::home::feed::Delivery as HomeDelivery;
 use kotonia_cli::home::heartbeat as home_heartbeat;
@@ -47,6 +48,7 @@ use kotonia_cli::login;
 use kotonia_cli::notifier;
 use kotonia_cli::serve;
 use kotonia_cli::telemetry;
+use kotonia_cli::vault::Vault;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -97,6 +99,102 @@ enum Cmd {
     /// a heartbeat and reminders that survive the machine sleeping.
     /// `kotonia-cli home init` to start, `kotonia-cli home run` to stay resident.
     Home(HomeArgs),
+
+    /// Accounts the agent may use (mail, API keys). Secrets go to the local
+    /// vault; the agent never sees them.
+    Connector(ConnectorArgs),
+
+    /// Read-only mail through a connected IMAP account.
+    Mail(MailArgs),
+
+    /// Secrets in the local vault (~/.kotonia/vault).
+    Secret(SecretArgs),
+}
+
+#[derive(Args, Debug)]
+struct ConnectorArgs {
+    #[command(subcommand)]
+    cmd: ConnectorCmd,
+}
+
+#[derive(Subcommand, Debug)]
+enum ConnectorCmd {
+    /// List connected accounts.
+    List,
+    /// Connect an account: gmail / icloud / imap / api_key.
+    Add {
+        kind: String,
+        /// Email address to prefill (mail) or service name (api_key).
+        #[arg(long)]
+        account: Option<String>,
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Test a connector's stored credentials.
+    Check { id: String },
+    /// Disconnect: delete the secret and the record.
+    Remove { id: String },
+}
+
+#[derive(Args, Debug)]
+struct MailArgs {
+    #[command(subcommand)]
+    cmd: MailCmd,
+}
+
+#[derive(Subcommand, Debug)]
+enum MailCmd {
+    /// Newest messages in INBOX (headers + snippet).
+    Recent {
+        /// Connector id (default: the first mail connector).
+        #[arg(long)]
+        connector: Option<String>,
+        /// Look back this many days.
+        #[arg(long, default_value_t = 2)]
+        days: i64,
+        /// Only messages that arrived since the previous `--new` call.
+        #[arg(long)]
+        new: bool,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Print one message.
+    Read {
+        uid: u32,
+        #[arg(long)]
+        connector: Option<String>,
+        #[arg(long, default_value_t = 12000)]
+        max_chars: usize,
+    },
+}
+
+#[derive(Args, Debug)]
+struct SecretArgs {
+    #[command(subcommand)]
+    cmd: SecretCmd,
+}
+
+#[derive(Subcommand, Debug)]
+enum SecretCmd {
+    /// List secret names (never values).
+    List,
+    /// Store a secret, typed at a hidden prompt.
+    Set {
+        name: String,
+    },
+    Remove {
+        name: String,
+    },
+    /// Run a command with a secret in its environment. Output is scrubbed
+    /// of the secret before it is printed.
+    Run {
+        name: String,
+        /// Environment variable name (default: the connector's, else SECRET).
+        #[arg(long)]
+        env: Option<String>,
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -375,6 +473,9 @@ async fn real_main() -> ExitCode {
         Some(Cmd::Logout(args)) => return run_logout(args),
         Some(Cmd::PairNotifier(args)) => return run_pair_notifier(args).await,
         Some(Cmd::Home(args)) => return run_home(args).await,
+        Some(Cmd::Connector(args)) => return run_connector(args).await,
+        Some(Cmd::Mail(args)) => return run_mail(args).await,
+        Some(Cmd::Secret(args)) => return run_secret(args).await,
         None => {}
     }
 
@@ -503,6 +604,7 @@ async fn real_main() -> ExitCode {
             let mut config = AgentConfig::new(approval_mode, in_place);
             config.max_iterations = cli.max_iterations;
             config.force_delimiter = cli.force_delimiter;
+            config.connectors = cli.home;
             config.persona_prefix = match home_prompt_prefix(cli.home) {
                 Ok(home) => join_prefixes(home, frontend_system_prompt_prefix()),
                 Err(e) => {
@@ -676,10 +778,242 @@ fn home_prompt_prefix(enabled: bool) -> Result<Option<String>, String> {
             home.root().display()
         ));
     }
-    Ok(Some(home.prompt_block(
+    let mut block = home.prompt_block(
         home_workspace::DEFAULT_MAX_FILE_CHARS,
         home_workspace::DEFAULT_MAX_TOTAL_CHARS,
-    )))
+    );
+    block.push_str(&connectors::prompt_section(&self_exe()));
+    Ok(Some(block))
+}
+
+fn self_exe() -> String {
+    std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "kotonia-cli".to_string())
+}
+
+fn find_connector(
+    registry: &connectors::Registry,
+    id: Option<&str>,
+    want_mail: bool,
+) -> Result<connectors::ConnectorRecord, String> {
+    let found = match id {
+        Some(id) => registry.connectors.get(id).cloned(),
+        None if want_mail => registry.first_mail().cloned(),
+        None => None,
+    };
+    found.ok_or_else(|| match id {
+        Some(id) => format!("no connector `{id}` (see `kotonia-cli connector list`)"),
+        None => "no mail account connected (run `kotonia-cli connector add gmail`)".to_string(),
+    })
+}
+
+fn connector_secret(id: &str) -> Result<String, String> {
+    Vault::resolve()?
+        .get(id)?
+        .ok_or_else(|| format!("the secret for `{id}` is missing; connect it again"))
+}
+
+async fn run_connector(args: ConnectorArgs) -> ExitCode {
+    let result: Result<(), String> = async {
+        match args.cmd {
+            ConnectorCmd::List => {
+                let r = connectors::Registry::load()?;
+                if r.connectors.is_empty() {
+                    println!("nothing connected");
+                }
+                for line in r.prompt_lines() {
+                    println!("{line}");
+                }
+                Ok(())
+            }
+            ConnectorCmd::Add {
+                kind,
+                account,
+                name,
+            } => {
+                let cat = connectors::Catalog::parse(&kind).ok_or_else(|| {
+                    format!(
+                        "unknown connector `{kind}` (one of {})",
+                        connectors::Catalog::NAMES.join(", ")
+                    )
+                })?;
+                let name = match (cat, name) {
+                    (connectors::Catalog::ApiKey, None) => Some(
+                        kotonia_cli::tty::read_visible_line("サービス名", None)
+                            .map_err(|e| e.to_string())?,
+                    ),
+                    (_, n) => n,
+                };
+                let card = connectors::card_for(cat, "", account.as_deref(), name.as_deref());
+                let values = kotonia_cli::tty::fill_connector_card(&card, false)
+                    .map_err(|e| e.to_string())?
+                    .ok_or("cancelled")?;
+                let c = connectors::connect_from_card(cat, &card, &values).await?;
+                println!("{}", c.for_human());
+                if c.check.ok {
+                    Ok(())
+                } else {
+                    Err("connection test failed".to_string())
+                }
+            }
+            ConnectorCmd::Check { id } => {
+                let mut r = connectors::Registry::load()?;
+                let rec = find_connector(&r, Some(&id), false)?;
+                let check = connectors::check_connector(&rec, &connector_secret(&id)?).await;
+                println!(
+                    "{}: {}",
+                    if check.ok { "ok" } else { "failed" },
+                    check.message
+                );
+                if let Some(c) = r.connectors.get_mut(&id) {
+                    c.last_check = Some(check);
+                }
+                r.save()
+            }
+            ConnectorCmd::Remove { id } => {
+                let mut r = connectors::Registry::load()?;
+                let had = r.connectors.remove(&id).is_some();
+                let had_secret = Vault::resolve()?.remove(&id)?;
+                if !had && !had_secret {
+                    return Err(format!("no connector `{id}`"));
+                }
+                r.save()?;
+                println!("removed {id}");
+                Ok(())
+            }
+        }
+    }
+    .await;
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("kotonia-cli connector: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+async fn run_mail(args: MailArgs) -> ExitCode {
+    let offset = home_schedule::local_offset_now();
+    let result: Result<String, String> = async {
+        let registry = connectors::Registry::load()?;
+        match args.cmd {
+            MailCmd::Recent {
+                connector,
+                days,
+                new,
+                limit,
+            } => {
+                let rec = find_connector(&registry, connector.as_deref(), true)?;
+                let secret = connector_secret(&rec.id)?;
+                let window = if new {
+                    connectors::mail::Window::New
+                } else {
+                    connectors::mail::Window::SinceDays(days)
+                };
+                let items = connectors::mail::recent(&rec, &secret, window, limit).await?;
+                Ok(connectors::mail::format_summaries(&items, offset))
+            }
+            MailCmd::Read {
+                uid,
+                connector,
+                max_chars,
+            } => {
+                let rec = find_connector(&registry, connector.as_deref(), true)?;
+                let secret = connector_secret(&rec.id)?;
+                let text = connectors::mail::read(&rec, &secret, uid).await?;
+                let text = match text.char_indices().nth(max_chars) {
+                    Some((i, _)) => format!("{}\n… (cut at {max_chars} characters)", &text[..i]),
+                    None => text,
+                };
+                Ok(connectors::mail::wrap_untrusted(&text))
+            }
+        }
+    }
+    .await;
+    match result {
+        Ok(out) => {
+            println!("{}", kotonia_cli::vault::redact(&out));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("kotonia-cli mail: {}", kotonia_cli::vault::redact(&e));
+            ExitCode::from(1)
+        }
+    }
+}
+
+async fn run_secret(args: SecretArgs) -> ExitCode {
+    let result: Result<i32, String> = async {
+        let vault = Vault::resolve()?;
+        match args.cmd {
+            SecretCmd::List => {
+                for n in vault.names() {
+                    println!("{n}");
+                }
+                Ok(0)
+            }
+            SecretCmd::Set { name } => {
+                kotonia_cli::vault::validate_name(&name)?;
+                let v =
+                    kotonia_cli::tty::read_hidden_line(&format!("{name} (入力は表示されません): "))
+                        .map_err(|e| e.to_string())?;
+                vault.set(&name, v.trim())?;
+                println!("stored {name}");
+                Ok(0)
+            }
+            SecretCmd::Remove { name } => {
+                if vault.remove(&name)? {
+                    println!("removed {name}");
+                    Ok(0)
+                } else {
+                    Err(format!("no secret `{name}`"))
+                }
+            }
+            SecretCmd::Run { name, env, command } => {
+                let value = vault
+                    .get(&name)?
+                    .ok_or_else(|| format!("no secret `{name}`"))?;
+                let env = env
+                    .or_else(|| {
+                        connectors::Registry::load().ok().and_then(|r| {
+                            r.connectors.get(&name).and_then(|c| match &c.kind {
+                                connectors::ConnectorKind::ApiKey { env } => Some(env.clone()),
+                                _ => None,
+                            })
+                        })
+                    })
+                    .unwrap_or_else(|| "SECRET".to_string());
+                let out = tokio::process::Command::new("bash")
+                    .arg("-c")
+                    .arg(command.join(" "))
+                    .env(&env, value.trim())
+                    .stdin(std::process::Stdio::null())
+                    .output()
+                    .await
+                    .map_err(|e| format!("spawn: {e}"))?;
+                let scrub = |b: &[u8]| {
+                    kotonia_cli::vault::redact_with(
+                        &String::from_utf8_lossy(b),
+                        &[value.trim().to_string()],
+                    )
+                };
+                print!("{}", scrub(&out.stdout));
+                eprint!("{}", scrub(&out.stderr));
+                Ok(out.status.code().unwrap_or(1))
+            }
+        }
+    }
+    .await;
+    match result {
+        Ok(0) => ExitCode::SUCCESS,
+        Ok(code) => ExitCode::from(code.clamp(1, 255) as u8),
+        Err(e) => {
+            eprintln!("kotonia-cli secret: {e}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 /// Home block first (who you are, what you remember), then the frontend's
@@ -1390,6 +1724,9 @@ impl EventSink for StdoutSink {
             Event::Bash { command } => {
                 println!("\n$ {command}");
             }
+            Event::ConnectorRequested { title, .. } => {
+                println!("\n[connector] {title} への接続を求めています");
+            }
             Event::BashSkipped { command, reason } => {
                 println!("\n[skipped] {reason}");
                 println!("$ {command}");
@@ -1483,6 +1820,17 @@ impl ApprovalHandler for StdioApproval {
             ApprovalOutcome::Approve
         } else {
             ApprovalOutcome::Deny
+        }
+    }
+
+    fn request_connection(&mut self, card: &connectors::ConnectorCard) -> ConnectionReply {
+        if !atty_stdin() {
+            return ConnectionReply::Unavailable;
+        }
+        match kotonia_cli::tty::fill_connector_card(card, true) {
+            Ok(Some(values)) => ConnectionReply::Provided(values),
+            Ok(None) => ConnectionReply::Declined,
+            Err(_) => ConnectionReply::Unavailable,
         }
     }
 }
