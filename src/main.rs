@@ -165,6 +165,9 @@ enum MailCmd {
         connector: Option<String>,
         #[arg(long, default_value_t = 12000)]
         max_chars: usize,
+        /// Show the MIME structure instead of the text.
+        #[arg(long)]
+        parts: bool,
     },
 }
 
@@ -919,10 +922,11 @@ async fn run_mail(args: MailArgs) -> ExitCode {
                 uid,
                 connector,
                 max_chars,
+                parts,
             } => {
                 let rec = find_connector(&registry, connector.as_deref(), true)?;
                 let secret = connector_secret(&rec.id)?;
-                let text = connectors::mail::read(&rec, &secret, uid).await?;
+                let text = connectors::mail::read(&rec, &secret, uid, offset, parts).await?;
                 let text = match text.char_indices().nth(max_chars) {
                     Some((i, _)) => format!("{}\n… (cut at {max_chars} characters)", &text[..i]),
                     None => text,

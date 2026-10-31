@@ -154,7 +154,13 @@ pub async fn recent(
     Ok(out)
 }
 
-pub async fn read(record: &ConnectorRecord, password: &str, uid: u32) -> Result<String, String> {
+pub async fn read(
+    record: &ConnectorRecord,
+    password: &str,
+    uid: u32,
+    offset: chrono::FixedOffset,
+    parts: bool,
+) -> Result<String, String> {
     let (host, port, user, pw) = creds(record, password)?;
     let mut s = ImapSession::connect(&host, port)
         .await
@@ -170,7 +176,11 @@ pub async fn read(record: &ConnectorRecord, password: &str, uid: u32) -> Result<
         .into_iter()
         .find(|m| m.uid == uid)
         .ok_or_else(|| format!("no message with UID {uid} in INBOX"))?;
-    Ok(render_full(&m.raw))
+    Ok(if parts {
+        parts_overview(&m.raw)
+    } else {
+        render_full(&m.raw, offset)
+    })
 }
 
 pub fn summarize(uid: u32, seen: bool, raw: &[u8]) -> MailSummary {
@@ -203,14 +213,86 @@ pub fn summarize(uid: u32, seen: bool, raw: &[u8]) -> MailSummary {
     }
 }
 
+/// The readable body: the text part, unless the HTML part says something
+/// the text part does not. Senders like Money Forward put a stub in
+/// text/plain ("please view this as HTML") and the actual transaction only in
+/// text/html; length alone does not tell these apart (378 vs 501 characters
+/// in the real mail), but content does. When a mail has only one of the two
+/// parts, mail-parser synthesises the other from it, so coverage is ~1 and
+/// the text part wins.
 fn body_text(msg: &mail_parser::Message) -> String {
-    if let Some(t) = msg.body_text(0) {
-        return t.into_owned();
+    let text = msg.body_text(0).map(|t| t.into_owned()).unwrap_or_default();
+    let html = msg.body_html(0).map(|h| strip_html(&h)).unwrap_or_default();
+    if text.trim().is_empty() || html_coverage_in_text(&html, &text) < 0.5 {
+        if html.trim().is_empty() {
+            text
+        } else {
+            html
+        }
+    } else {
+        text
     }
-    msg.body_html(0).map(|h| strip_html(&h)).unwrap_or_default()
 }
 
-fn render_full(raw: &[u8]) -> String {
+/// Fraction of the HTML's substantive lines that also appear in the text
+/// part (whitespace ignored). 1.0 when there is nothing to compare.
+fn html_coverage_in_text(html: &str, text: &str) -> f64 {
+    let squash = |s: &str| s.split_whitespace().collect::<String>();
+    let text = squash(text);
+    let lines: Vec<String> = html
+        .lines()
+        .map(squash)
+        .filter(|l| l.chars().count() >= 4)
+        .collect();
+    if lines.is_empty() {
+        return 1.0;
+    }
+    let found = lines.iter().filter(|l| text.contains(l.as_str())).count();
+    found as f64 / lines.len() as f64
+}
+
+/// One line per MIME part: index, content type, size, whether it was cut by
+/// the partial fetch. For debugging "why is this body empty".
+pub fn parts_overview(raw: &[u8]) -> String {
+    let Some(msg) = MessageParser::default().parse(raw) else {
+        return "(could not parse this message)".to_string();
+    };
+    let mut out = format!(
+        "fetched {} bytes; text_body={:?} html_body={:?}\n",
+        raw.len(),
+        msg.text_body,
+        msg.html_body
+    );
+    for (i, p) in msg.parts.iter().enumerate() {
+        let ct = p
+            .content_type()
+            .map(|c| format!("{}/{}", c.ctype(), c.subtype().unwrap_or("")))
+            .unwrap_or_else(|| "?".into());
+        out.push_str(&format!("[{i}] {ct} {} bytes\n", p.len()));
+    }
+    let count = |s: &str| {
+        s.split_whitespace()
+            .map(|w| w.chars().count())
+            .sum::<usize>()
+    };
+    let text = msg.body_text(0).map(|t| t.into_owned()).unwrap_or_default();
+    let html = msg.body_html(0).map(|h| strip_html(&h)).unwrap_or_default();
+    out.push_str(&format!(
+        "text: {} chars / html (stripped): {} chars / html lines found in text: {:.0}%\n",
+        count(&text),
+        count(&html),
+        html_coverage_in_text(&html, &text) * 100.0
+    ));
+    let head = |s: &str| one_line(s, 160);
+    out.push_str(&format!(
+        "text head: {}\nhtml head: {}\n",
+        head(&text),
+        head(&html)
+    ));
+    out
+}
+
+fn render_full(raw: &[u8], offset: chrono::FixedOffset) -> String {
     let Some(msg) = MessageParser::default().parse(raw) else {
         return "(could not parse this message)".to_string();
     };
@@ -223,7 +305,12 @@ fn render_full(raw: &[u8]) -> String {
         "From: {}\nSubject: {}\nDate: {}\n",
         s.from,
         s.subject,
-        s.date.map(|d| d.to_rfc3339()).unwrap_or_default()
+        s.date
+            .map(|d| d
+                .with_timezone(&offset)
+                .format("%Y-%m-%d %H:%M %:z")
+                .to_string())
+            .unwrap_or_default()
     );
     if !attachments.is_empty() {
         out.push_str(&format!("Attachments: {}\n", attachments.join(", ")));
@@ -269,11 +356,95 @@ pub fn strip_html(html: &str) -> String {
             out.push(c);
         }
     }
-    out.replace("&nbsp;", " ")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
+    let decoded = decode_entities(&out);
+    // Layout tables leave runs of blank / space-only lines; keep one.
+    let mut squeezed = String::with_capacity(decoded.len());
+    let mut blank = false;
+    for line in decoded.lines() {
+        let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if line.is_empty() {
+            if !blank && !squeezed.is_empty() {
+                squeezed.push('\n');
+            }
+            blank = true;
+        } else {
+            squeezed.push_str(&line);
+            squeezed.push('\n');
+            blank = false;
+        }
+    }
+    squeezed.trim_end().to_string()
+}
+
+/// Decode HTML character references and drop invisible padding. Marketing
+/// mail pads its preview text with hundreds of `&#847; &zwnj; &shy;`, which
+/// would otherwise eat the model's context for nothing.
+fn decode_entities(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp + 1..];
+        let end = after
+            .char_indices()
+            .take(12)
+            .find(|(_, c)| *c == ';')
+            .map(|(i, _)| i);
+        let decoded = end.and_then(|end| {
+            let name = &after[..end];
+            let c = if let Some(num) = name.strip_prefix("#x").or_else(|| name.strip_prefix("#X")) {
+                u32::from_str_radix(num, 16).ok().and_then(char::from_u32)
+            } else if let Some(num) = name.strip_prefix('#') {
+                num.parse::<u32>().ok().and_then(char::from_u32)
+            } else {
+                Some(match name {
+                    "nbsp" | "ensp" | "emsp" | "thinsp" => ' ',
+                    "amp" => '&',
+                    "lt" => '<',
+                    "gt" => '>',
+                    "quot" => '"',
+                    "apos" => '\'',
+                    "yen" => '¥',
+                    "copy" => '©',
+                    "reg" => '®',
+                    "hellip" => '…',
+                    "mdash" => '—',
+                    "ndash" => '–',
+                    "laquo" => '«',
+                    "raquo" => '»',
+                    "zwnj" | "zwj" | "shy" => '\u{200C}',
+                    _ => return None,
+                })
+            }?;
+            Some((c, end))
+        });
+        match decoded {
+            Some((c, end)) => {
+                out.push(c);
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out.chars()
+        .filter(|c| {
+            !matches!(
+                c,
+                '\u{00AD}' | '\u{034F}' | '\u{200B}'..='\u{200F}' | '\u{2060}' | '\u{FEFF}'
+            )
+        })
+        .map(|c| {
+            if c == '\u{2007}' || c == '\u{00A0}' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 fn one_line(s: &str, max_chars: usize) -> String {
@@ -339,6 +510,36 @@ Content-Transfer-Encoding: 7bit\r\n\r\n\
 <html><style>p{color:red}</style><p>Hello&nbsp;<b>world</b></p></html>";
         let s = summarize(1, true, raw);
         assert_eq!(s.snippet, "Hello world");
+    }
+
+    #[test]
+    fn a_text_stub_next_to_a_rich_html_part_yields_the_html() {
+        let html_rows =
+            "<tr><td>2026/10/31</td><td>カード利用 ローソン</td><td>-1,234円</td></tr>".repeat(20);
+        let raw = format!(
+            "From: a@b.c\r\nSubject: 出金のお知らせ\r\nMIME-Version: 1.0\r\n\
+Content-Type: multipart/alternative; boundary=XX\r\n\r\n\
+--XX\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n\
+HTMLメールでご覧ください。\r\n\
+--XX\r\nContent-Type: text/html; charset=utf-8\r\n\r\n\
+<html><body><table>{html_rows}</table></body></html>\r\n--XX--\r\n"
+        );
+        let s = summarize(1, false, raw.as_bytes());
+        assert!(s.snippet.contains("ローソン"), "{}", s.snippet);
+        // A plain mail with a real text body keeps it.
+        let plain = b"From: a@b.c\r\nSubject: x\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nhello there\r\n";
+        assert_eq!(summarize(2, false, plain).snippet, "hello there");
+    }
+
+    #[test]
+    fn entities_decode_and_invisible_padding_disappears() {
+        assert_eq!(
+            strip_html(
+                "<p>Tom &amp; Jerry &#8212; &#x30AB; &yen;500</p>&#847; &zwnj; &#8199; &shy;&#847;"
+            ),
+            "Tom & Jerry — カ ¥500"
+        );
+        assert_eq!(strip_html("a & b &unknown; c"), "a & b &unknown; c");
     }
 
     #[test]
