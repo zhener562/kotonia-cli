@@ -61,7 +61,9 @@ jobs:
           # Silicon uses the arm64 asset, so only genuine Intel Macs would need
           # this — and the macos-13 runner GitHub deprecated queues for a long
           # time. Intel Mac falls back to a `kotonia-cli` on PATH.
-          - os: macos-14
+          # macos-14 runner images are retired on 2026-11-02 (the v0.1.12
+          # dry run hit the brownout).
+          - os: macos-15
             target: aarch64-apple-darwin
             asset: kotonia-cli-darwin-arm64
           - os: windows-2022
