@@ -250,7 +250,7 @@ fn assistant_message_to_wire(content: &[AiContent]) -> Result<Value, AiError> {
                 "type": "function",
                 "function": {
                     "name": name,
-                    "arguments": serde_json::to_string(input).map_err(|e| {
+                    "arguments": serde_json::to_string(&ensure_object(input)).map_err(|e| {
                         AiError::Invalid(format!("failed to serialize tool arguments: {}", e))
                     })?,
                 },
@@ -379,12 +379,7 @@ fn wire_response_to_ai(resp: CompatResponse) -> Result<AiResponse, AiError> {
     }
 
     for call in choice.message.tool_calls {
-        let input = if call.function.arguments.trim().is_empty() {
-            Value::Object(Map::new())
-        } else {
-            serde_json::from_str(&call.function.arguments)
-                .unwrap_or_else(|_| Value::String(call.function.arguments.clone()))
-        };
+        let input = tool_arguments_object(&call.function.arguments);
         content.push(AiContent::ToolUse {
             id: call.id,
             name: call.function.name,
@@ -428,6 +423,85 @@ fn wire_response_to_ai(resp: CompatResponse) -> Result<AiResponse, AiError> {
                 .max(0) as u32,
         },
     })
+}
+
+/// Key under which unparseable tool arguments are kept (truncated).
+pub const UNPARSED_ARGUMENTS: &str = "_unparsed_arguments";
+const UNPARSED_KEEP_CHARS: usize = 400;
+
+/// Tool-call arguments as a JSON object, always.
+///
+/// Chat templates iterate the arguments (`_args.items()` in GLM's), so a
+/// non-object in the history makes *every later request* fail with 400 —
+/// the session is dead until restarted (2026-11-01: the model looped on
+/// `.split(b' ')[0]` until it hit max_tokens, the cut-off arguments were
+/// stored as a string, and the next request was rejected). Here:
+/// - a JSON object passes through
+/// - a JSON string holding an object (double-encoded) is unwrapped
+/// - anything else becomes `{"_unparsed_arguments": "<first 400 chars>"}`
+pub fn tool_arguments_object(raw: &str) -> Value {
+    if raw.trim().is_empty() {
+        return Value::Object(Map::new());
+    }
+    match serde_json::from_str::<Value>(raw) {
+        Ok(Value::Object(m)) => Value::Object(m),
+        Ok(Value::String(inner)) => match serde_json::from_str::<Value>(&inner) {
+            Ok(Value::Object(m)) => Value::Object(m),
+            _ => unparsed(&inner),
+        },
+        _ => unparsed(raw),
+    }
+}
+
+/// Same guarantee for a value already in the history (sessions resumed from
+/// a log written before this existed).
+pub fn ensure_object(v: &Value) -> Value {
+    match v {
+        Value::Object(_) => v.clone(),
+        Value::String(s) => tool_arguments_object(s),
+        other => unparsed(&other.to_string()),
+    }
+}
+
+fn unparsed(raw: &str) -> Value {
+    let kept: String = raw.chars().take(UNPARSED_KEEP_CHARS).collect();
+    let mut m = Map::new();
+    m.insert(UNPARSED_ARGUMENTS.to_string(), Value::String(kept));
+    Value::Object(m)
+}
+
+#[cfg(test)]
+mod argument_tests {
+    use super::*;
+
+    #[test]
+    fn arguments_are_always_an_object() {
+        assert_eq!(
+            tool_arguments_object(r#"{"command":"ls"}"#)["command"],
+            "ls"
+        );
+        // Double-encoded: a JSON string holding the object.
+        assert_eq!(
+            tool_arguments_object(r#""{\"command\":\"ls\"}""#)["command"],
+            "ls"
+        );
+        // Cut off mid-way (the looping case).
+        let cut = format!(
+            r#"{{"command":"python3 - <<'EOF'\n{}"#,
+            ".split(b' ')[0]".repeat(500)
+        );
+        let v = tool_arguments_object(&cut);
+        assert!(v.is_object());
+        assert_eq!(
+            v[UNPARSED_ARGUMENTS].as_str().unwrap().chars().count(),
+            UNPARSED_KEEP_CHARS
+        );
+        assert!(tool_arguments_object("[1,2]").is_object());
+        assert_eq!(tool_arguments_object("  "), serde_json::json!({}));
+        // History written before the fix.
+        assert!(ensure_object(&Value::String("not json".into())).is_object());
+        assert_eq!(ensure_object(&serde_json::json!({"a":1}))["a"], 1);
+    }
 }
 
 #[cfg(test)]

@@ -1022,6 +1022,20 @@ If the check really needs it, say so in your message to the user."
         approval: &mut dyn ApprovalHandler,
         sink: &mut dyn EventSink,
     ) -> Result<(String, bool), AgentError> {
+        if let Some(raw) = input
+            .get(crate::ai::openai_compat::UNPARSED_ARGUMENTS)
+            .and_then(|v| v.as_str())
+        {
+            let head: String = raw.chars().take(120).collect();
+            return Ok((
+                format!(
+                    "Your `{name}` call's arguments were not valid JSON — probably cut off at the \
+output limit (they began: {head:?}). Nothing was run. Send the call again with short, \
+complete arguments; if you were writing a long script, write it in smaller steps."
+                ),
+                true,
+            ));
+        }
         match name {
             "bash" => {
                 let command = input
