@@ -232,7 +232,9 @@ async fn run_heartbeat(
     }
 
     let preferences = home.read(PROACTIVE_FILE);
-    let prompt = heartbeat::build_prompt(checks, preferences.as_deref(), now, offset, missed);
+    let quiet = heartbeat::quiet_token();
+    let prompt =
+        heartbeat::build_prompt(&quiet, checks, preferences.as_deref(), now, offset, missed);
     let mut approval = HeadlessApproval::default();
     let mut sink = QuietSink;
     let result = tokio::time::timeout(
@@ -253,9 +255,13 @@ async fn run_heartbeat(
     }
 
     match result {
-        Ok(Ok(answer)) if heartbeat::is_quiet(&answer) => {
+        Ok(Ok(answer)) if heartbeat::is_quiet(&answer, &quiet) => {
             eprintln!("[home] heartbeat: nothing to report ({session_id})");
         }
+        Ok(Ok(answer)) if answer.trim().is_empty() => delivery.record(
+            &fail(format!("heartbeat returned an empty answer ({session_id})")),
+            offset,
+        ),
         Ok(Ok(answer)) => {
             delivery
                 .deliver(
