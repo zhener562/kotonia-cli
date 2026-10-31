@@ -55,6 +55,28 @@ pub trait ApprovalHandler: Send {
     fn request_connection(&mut self, _card: &crate::connectors::ConnectorCard) -> ConnectionReply {
         ConnectionReply::Unavailable
     }
+
+    /// The agent wants to open a site that is not on the approved list.
+    /// Frontends that can offer "always allow" override this; the default
+    /// is a plain yes/no through [`ApprovalHandler::ask`].
+    fn ask_site(&mut self, host: &str, url: &str) -> SiteDecision {
+        match self.ask(
+            &format!("fetch-url {url}"),
+            &format!("open {host} (not an approved site)"),
+        ) {
+            ApprovalOutcome::Approve => SiteDecision::Once,
+            ApprovalOutcome::Deny => SiteDecision::Deny,
+        }
+    }
+}
+
+/// Answer to [`ApprovalHandler::ask_site`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SiteDecision {
+    Once,
+    /// Open it and add the site to `~/.kotonia/web-allow.json`.
+    Always,
+    Deny,
 }
 
 /// Answer to [`ApprovalHandler::request_connection`].
@@ -940,10 +962,24 @@ impl Agent {
         approval: &mut dyn ApprovalHandler,
         sink: &mut dyn EventSink,
     ) -> Option<(String, bool)> {
+        self.gate_unattended_network_because(
+            command,
+            "network tool during an unattended run",
+            approval,
+            sink,
+        )
+    }
+
+    fn gate_unattended_network_because(
+        &self,
+        command: &str,
+        reason: &str,
+        approval: &mut dyn ApprovalHandler,
+        sink: &mut dyn EventSink,
+    ) -> Option<(String, bool)> {
         if !self.config.unattended {
             return None;
         }
-        let reason = "network tool during an unattended run";
         if approval.ask(command, reason) == ApprovalOutcome::Approve {
             return None;
         }
@@ -952,9 +988,10 @@ impl Agent {
             reason: reason.to_string(),
         });
         Some((
-            "Not allowed: nobody is here to approve network access during this background \
-run. If the check really needs the web, say so in your message to the user."
-                .to_string(),
+            format!(
+                "Not allowed: {reason}. Nobody is here to approve it during this background run. \
+If the check really needs it, say so in your message to the user."
+            ),
             true,
         ))
     }
@@ -1079,6 +1116,75 @@ run. If the check really needs the web, say so in your message to the user."
                     ));
                 }
                 let max_chars = input.get("max_chars").and_then(|v| v.as_u64()).unwrap_or(0);
+                // Approved sites (Muse's "always allow this site"). Unattended:
+                // the only way out, fetched in-process so redirects stay on
+                // approved sites. Interactive home sessions: unfamiliar sites
+                // are asked about, and "always" adds them to the list.
+                if self.config.unattended || self.config.connectors {
+                    let mut allow = crate::web_allow::WebAllow::load().unwrap_or_default();
+                    if self.config.unattended {
+                        return match allow.check_unattended(&url) {
+                            Ok(_) => {
+                                sink.emit(Event::Bash {
+                                    command: format!("fetch (approved site) {url}"),
+                                });
+                                let r = crate::web_allow::fetch_unattended(
+                                    &allow,
+                                    &url,
+                                    max_chars as usize,
+                                )
+                                .await;
+                                let (text, is_error) = match r {
+                                    Ok(t) => (t, false),
+                                    Err(e) => (format!("fetch failed: {e}"), true),
+                                };
+                                let result = crate::execution::host::ExecutionResult {
+                                    exit_code: if is_error { 1 } else { 0 },
+                                    timed_out: false,
+                                    truncated: false,
+                                    combined: crate::vault::redact(&text),
+                                    full_output_path: None,
+                                };
+                                sink.emit(Event::Observation {
+                                    result: result.clone(),
+                                });
+                                self.history_append_observation(&result);
+                                Ok((result.as_observation(), is_error))
+                            }
+                            Err(why) => Ok(self
+                                .gate_unattended_network_because(
+                                    &format!("fetch-url {}", shell_single_quote(&url)),
+                                    &why,
+                                    approval,
+                                    sink,
+                                )
+                                .unwrap_or_else(|| {
+                                    ("Not allowed in a background run.".to_string(), true)
+                                })),
+                        };
+                    }
+                    let host = crate::web_allow::normalize_host(&url).unwrap_or_default();
+                    if !allow.allows_host(&host) {
+                        match approval.ask_site(&host, &url) {
+                            SiteDecision::Once => {}
+                            SiteDecision::Always => {
+                                let _ = allow.add(&host).and_then(|_| allow.save());
+                            }
+                            SiteDecision::Deny => {
+                                sink.emit(Event::BashSkipped {
+                                    command: format!("fetch-url {url}"),
+                                    reason: format!("user declined opening {host}"),
+                                });
+                                return Ok((
+                                    format!(
+                                        "The user declined opening {host}. Carry on without it."
+                                    ),
+                                    true,
+                                ));
+                            }
+                        }
+                    }
+                }
                 let escaped = shell_single_quote(&url);
                 let command = if max_chars > 0 {
                     format!("fetch-url {escaped} {max_chars}")

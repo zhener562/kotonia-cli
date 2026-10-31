@@ -26,6 +26,7 @@ use serde::Serialize;
 
 use kotonia_cli::agent::agent::{
     Agent, AgentConfig, ApprovalHandler, ApprovalOutcome, ConnectionReply, Event, EventSink,
+    SiteDecision,
 };
 use kotonia_cli::agent::approval::ApprovalMode;
 use kotonia_cli::agent::claude_code::ClaudeCodeAgent;
@@ -109,6 +110,28 @@ enum Cmd {
 
     /// Secrets in the local vault (~/.kotonia/vault).
     Secret(SecretArgs),
+
+    /// Websites the agent may open without asking — the only sites a
+    /// background run (heartbeat) can reach at all.
+    Web(WebArgs),
+}
+
+#[derive(Args, Debug)]
+struct WebArgs {
+    #[command(subcommand)]
+    cmd: WebCmd,
+}
+
+#[derive(Subcommand, Debug)]
+enum WebCmd {
+    /// Approve sites (`wttr.in`, `https://example.com/…`). Subdomains are covered.
+    Allow {
+        sites: Vec<String>,
+    },
+    List,
+    Remove {
+        site: String,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -479,6 +502,7 @@ async fn real_main() -> ExitCode {
         Some(Cmd::Connector(args)) => return run_connector(args).await,
         Some(Cmd::Mail(args)) => return run_mail(args).await,
         Some(Cmd::Secret(args)) => return run_secret(args).await,
+        Some(Cmd::Web(args)) => return run_web(args),
         None => {}
     }
 
@@ -943,6 +967,47 @@ async fn run_mail(args: MailArgs) -> ExitCode {
         }
         Err(e) => {
             eprintln!("kotonia-cli mail: {}", kotonia_cli::vault::redact(&e));
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_web(args: WebArgs) -> ExitCode {
+    let result: Result<(), String> = (|| {
+        let mut w = kotonia_cli::web_allow::WebAllow::load()?;
+        match args.cmd {
+            WebCmd::Allow { sites } => {
+                if sites.is_empty() {
+                    return Err("name at least one site".into());
+                }
+                for s in sites {
+                    println!("allowed {}", w.add(&s)?);
+                }
+                w.save()
+            }
+            WebCmd::List => {
+                if w.sites.is_empty() {
+                    println!("no approved sites");
+                }
+                for h in w.sites.keys() {
+                    println!("{h}");
+                }
+                Ok(())
+            }
+            WebCmd::Remove { site } => {
+                if w.remove(&site) {
+                    println!("removed {site}");
+                    w.save()
+                } else {
+                    Err(format!("`{site}` is not on the list"))
+                }
+            }
+        }
+    })();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("kotonia-cli web: {e}");
             ExitCode::from(1)
         }
     }
@@ -1822,6 +1887,22 @@ impl ApprovalHandler for StdioApproval {
             ApprovalOutcome::Approve
         } else {
             ApprovalOutcome::Deny
+        }
+    }
+
+    fn ask_site(&mut self, host: &str, url: &str) -> SiteDecision {
+        eprintln!("\n────── 見慣れないサイトを開こうとしています ──────");
+        eprintln!("{url}");
+        eprint!("{host} を開きますか？ [y] 今回だけ / [a] 常に許可 / [N] 開かない: ");
+        let _ = io::stderr().flush();
+        let mut buf = String::new();
+        if self.stdin.lock().read_line(&mut buf).is_err() {
+            return SiteDecision::Deny;
+        }
+        match buf.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => SiteDecision::Once,
+            "a" | "always" => SiteDecision::Always,
+            _ => SiteDecision::Deny,
         }
     }
 

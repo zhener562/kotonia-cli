@@ -406,7 +406,11 @@ pub async fn check_connector(record: &ConnectorRecord, secret: &str) -> CheckRes
 pub fn prompt_section(exe: &str) -> String {
     let registry = Registry::load().unwrap_or_default();
     let lines = registry.prompt_lines();
-    let mut out = String::from("\n# Connectors\n\n");
+    let web = crate::web_allow::WebAllow::load().unwrap_or_default();
+    let mut out = format!(
+        "\n# Web access\n\n{}\n\n# Connectors\n\n",
+        web.prompt_line()
+    );
     if lines.is_empty() {
         out.push_str("Nothing is connected yet.\n");
     } else {

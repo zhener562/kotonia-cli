@@ -21,3 +21,4 @@ pub mod serve;
 pub mod telemetry;
 pub mod tty;
 pub mod vault;
+pub mod web_allow;

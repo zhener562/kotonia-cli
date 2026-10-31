@@ -272,6 +272,31 @@ kotonia-cli secret run <id> -- 'curl -H "Authorization: Bearer $KOTONIA_TTS_API_
   the daemon and heartbeats answer "nobody can fill a card right now", and the
   agent tells the user to run `connector add`.
 
+### Web access in background runs
+
+A heartbeat runs with nobody watching, so text it reads (mail, pages) could
+try to make it carry data out in a URL. By default every network tool is
+blocked there — `curl`/`wget` were already gated by the allowlist, and
+`fetch_url` / `web_search` are gated too in unattended runs.
+
+```bash
+kotonia-cli web allow wttr.in        # approve a site (subdomains included)
+kotonia-cli web list | remove <site>
+```
+
+- During a heartbeat, `fetch_url` may open an approved site with **GET, no
+  `?query`, no `#fragment`, path ≤ 160 chars**. The page is fetched by
+  kotonia-cli itself: redirects are followed only to other approved,
+  query-less URLs, no cookies are kept, and the text comes back fenced as
+  untrusted web content. Everything else is refused and recorded in the feed
+  with the `web allow` command to run if it should have been allowed.
+- `web_search` stays blocked in background runs: the query itself would leave.
+- In `--home` conversations, opening a site that is not approved asks
+  `[y] once / [a] always / [N] no`; `a` adds it to the list.
+- Data packed into the *path* of an approved site still gets out; it only
+  matters if someone else can read that site's request logs. Approve sites
+  you trust, not "the web".
+
 ### Approval modes
 
 `--approval` controls how `bash` commands are gated in the **ReAct**
