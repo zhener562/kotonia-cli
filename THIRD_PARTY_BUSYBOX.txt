@@ -1,0 +1,14 @@
+busybox.exe (Windows only)
+
+kotonia-cli runs agent commands in bash. On Windows machines without Git for
+Windows, it falls back to the bundled busybox.exe, a separate program:
+
+  busybox-w32, version FRP-6354-g5f09fb446 (64-bit build)
+  Copyright Erik Andersen, Rob Landley, Denys Vlasenko, Ron Yorston and others
+  License: GNU General Public License, version 2
+  Binary and source: https://frippery.org/busybox/
+  Source for this version: https://frippery.org/files/busybox/busybox-w32-FRP-6354-g5f09fb446.tgz
+  Source repository: https://github.com/rmyorston/busybox-w32
+
+Installing Git for Windows (https://gitforwindows.org) makes kotonia-cli use
+bash instead; busybox.exe can then be deleted.

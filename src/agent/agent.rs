@@ -298,6 +298,13 @@ impl Agent {
         } else {
             system_prompt(workspace_root, config.in_place, kotonia_base)
         };
+        // No bash on this machine (a fresh Windows install): commands run in
+        // BusyBox sh. Say so, or the model writes bash-only syntax that fails.
+        let base_prompt = if crate::execution::host::shell_kind() == Some("busybox") {
+            format!("{base_prompt}\n\n{BUSYBOX_NOTE}")
+        } else {
+            base_prompt
+        };
         let home = crate::home::workspace::HomeDir::resolve().ok();
         let memory_base = crate::project::projects_base().ok();
         let memory = if config.project_memory
@@ -2043,6 +2050,15 @@ fn mail_tools() -> Vec<AiTool> {
         },
     ]
 }
+
+/// Appended to the system prompt when commands run in BusyBox sh.
+const BUSYBOX_NOTE: &str = "# Shell\n\n\
+The `bash` tool runs BusyBox `sh` here, not bash (this machine has no bash installed). \
+POSIX sh works, and so do the common commands (ls, cat, grep, sed, awk, find, head, tail, \
+wc, sort, diff, wget). Avoid bash-only syntax: `[[ ]]`, arrays, `<(...)`, `{a,b}` brace \
+expansion, `source` (use `.`). Programs installed on Windows (python, node, git) run if \
+they are on PATH. Paths may be written with forward slashes. Prefer `edit_file` for \
+changing files.";
 
 /// True when `path` (which may not exist yet) is inside `root`, after
 /// resolving symlinks and `..` on the part that exists.

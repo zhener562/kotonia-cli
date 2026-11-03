@@ -36,6 +36,12 @@ pub fn header_value() -> &'static str {
         let version = env!("CARGO_PKG_VERSION");
         let platform = platform();
         let wsl = if is_wsl() { "; wsl" } else { "" };
+        // `; busybox` when no bash was found and the fallback runs commands.
+        let wsl = match crate::execution::host::shell_kind() {
+            Some("busybox") => format!("{wsl}; busybox"),
+            None => format!("{wsl}; noshell"),
+            _ => wsl.to_string(),
+        };
         match MODE.get() {
             Some(mode) => format!("{name}/{version} ({platform}{wsl}) {mode}"),
             None => format!("{name}/{version} ({platform}{wsl})"),

@@ -22,7 +22,9 @@ use crate::client_info;
 
 const TIMEOUT: Duration = Duration::from_secs(2);
 
-struct Run {
+/// One agent run. The CLI has one per process (the free functions below);
+/// embedders such as kotonia-desktop make one per task with [`Run::begin`].
+pub struct Run {
     id: String,
     started: Instant,
     base: String,
@@ -54,45 +56,98 @@ pub fn opted_out() -> bool {
 /// Begin a run and send `start` in the background. No-op when opted out or
 /// not logged in to kotonia.
 pub fn start(engine: &str, model: &str) {
-    if opted_out() {
+    let Some(run) = Run::new(engine, model) else {
         return;
-    }
-    let Some(token) = std::env::var("KOTONIA_API_KEY")
-        .ok()
-        .filter(|t| !t.trim().is_empty())
-    else {
-        return;
-    };
-    let base = std::env::var("KOTONIA_API_BASE")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "https://kotonia.ai".to_string());
-    let run = Run {
-        id: uuid::Uuid::new_v4().to_string(),
-        started: Instant::now(),
-        base: base.trim_end_matches('/').to_string(),
-        token,
-        engine: label(engine).to_string(),
-        provider: if engine == "claude-code" {
-            "claude"
-        } else if model.starts_with("kotonia") {
-            "kotonia"
-        } else {
-            "other"
-        },
-        mode: Mutex::new("unknown"),
-        fail: Mutex::new(None),
-        start_send: Mutex::new(None),
     };
     if RUN.set(run).is_err() {
         return;
     }
-    let body = payload("start", None);
-    let handle = tokio::spawn(async move {
-        send(body).await;
-    });
     if let Some(run) = RUN.get() {
+        let body = run.payload("start", None);
+        let handle = tokio::spawn(async move {
+            send_to(body).await;
+        });
         *run.start_send.lock().unwrap() = Some(handle);
+    }
+}
+
+impl Run {
+    /// None when opted out or not logged in to kotonia.
+    fn new(engine: &str, model: &str) -> Option<Self> {
+        if opted_out() {
+            return None;
+        }
+        let token = std::env::var("KOTONIA_API_KEY")
+            .ok()
+            .filter(|t| !t.trim().is_empty())?;
+        let base = std::env::var("KOTONIA_API_BASE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "https://kotonia.ai".to_string());
+        Some(Run {
+            id: uuid::Uuid::new_v4().to_string(),
+            started: Instant::now(),
+            base: base.trim_end_matches('/').to_string(),
+            token,
+            engine: label(engine).to_string(),
+            provider: if engine == "claude-code" {
+                "claude"
+            } else if model.starts_with("kotonia") {
+                "kotonia"
+            } else {
+                "other"
+            },
+            mode: Mutex::new("unknown"),
+            fail: Mutex::new(None),
+            start_send: Mutex::new(None),
+        })
+    }
+
+    /// Begin a run for an embedder and send `start` in the background.
+    /// `mode` is a fixed label such as `desktop`.
+    pub fn begin(engine: &str, model: &str, mode: &'static str) -> Option<std::sync::Arc<Self>> {
+        let run = std::sync::Arc::new(Self::new(engine, model)?);
+        *run.mode.lock().unwrap() = mode;
+        let body = run.payload("start", None);
+        let (base, token) = (run.base.clone(), run.token.clone());
+        let handle = tokio::spawn(async move {
+            post(&base, &token, body).await;
+        });
+        *run.start_send.lock().unwrap() = Some(handle);
+        Some(run)
+    }
+
+    /// Record why the run failed. The first label wins.
+    pub fn fail(&self, kind: &'static str) {
+        let mut fail = self.fail.lock().unwrap();
+        if fail.is_none() {
+            *fail = Some(kind);
+        }
+    }
+
+    /// Send `end` (bounded by a short timeout), after `start` is out.
+    pub async fn finish(&self, ok: bool) {
+        let start_send = self.start_send.lock().unwrap().take();
+        if let Some(handle) = start_send {
+            let _ = tokio::time::timeout(TIMEOUT, handle).await;
+        }
+        post(&self.base, &self.token, self.payload("end", Some(ok))).await;
+    }
+
+    fn payload(&self, phase: &str, ok: Option<bool>) -> serde_json::Value {
+        let mut body = json!({
+            "phase": phase,
+            "run_id": self.id,
+            "engine": self.engine,
+            "provider": self.provider,
+        });
+        if let Some(ok) = ok {
+            body["mode"] = json!(*self.mode.lock().unwrap());
+            body["outcome"] = json!(if ok { "ok" } else { "error" });
+            body["fail"] = json!(*self.fail.lock().unwrap());
+            body["duration_ms"] = json!(self.started.elapsed().as_millis() as u64);
+        }
+        body
     }
 }
 
@@ -106,23 +161,15 @@ pub fn set_mode(mode: &'static str) {
 /// Record why the run failed. The first label wins (the root cause).
 pub fn fail(kind: &'static str) {
     if let Some(run) = RUN.get() {
-        let mut fail = run.fail.lock().unwrap();
-        if fail.is_none() {
-            *fail = Some(kind);
-        }
+        run.fail(kind);
     }
 }
 
 /// Send `end` and wait for it (bounded by a short timeout).
 pub async fn finish(ok: bool) {
-    let Some(run) = RUN.get() else {
-        return;
-    };
-    let start_send = run.start_send.lock().unwrap().take();
-    if let Some(handle) = start_send {
-        let _ = tokio::time::timeout(TIMEOUT, handle).await;
+    if let Some(run) = RUN.get() {
+        run.finish(ok).await;
     }
-    send(payload("end", Some(ok))).await;
 }
 
 /// Fixed label for an agent error. The error text itself is never sent.
@@ -131,6 +178,9 @@ pub fn failure_kind(error: &DispatchError) -> &'static str {
     use crate::agent::claude_code::ClaudeCodeError;
     match error {
         DispatchError::ReAct(AgentError::Llm(msg)) => llm_failure_kind(msg),
+        DispatchError::ReAct(AgentError::Executor(msg)) if msg.contains("no shell found") => {
+            "no_shell"
+        }
         DispatchError::ReAct(AgentError::Executor(_)) => "executor",
         DispatchError::ReAct(AgentError::IterationLimit(_)) => "iteration_limit",
         DispatchError::ReAct(AgentError::Cancelled) => "cancelled",
@@ -169,35 +219,19 @@ fn label(raw: &str) -> &'static str {
     }
 }
 
-fn payload(phase: &str, ok: Option<bool>) -> serde_json::Value {
-    let Some(run) = RUN.get() else {
-        return json!({});
-    };
-    let mut body = json!({
-        "phase": phase,
-        "run_id": run.id,
-        "engine": run.engine,
-        "provider": run.provider,
-    });
-    if let Some(ok) = ok {
-        body["mode"] = json!(*run.mode.lock().unwrap());
-        body["outcome"] = json!(if ok { "ok" } else { "error" });
-        body["fail"] = json!(*run.fail.lock().unwrap());
-        body["duration_ms"] = json!(run.started.elapsed().as_millis() as u64);
+async fn send_to(body: serde_json::Value) {
+    if let Some(run) = RUN.get() {
+        post(&run.base, &run.token, body).await;
     }
-    body
 }
 
-async fn send(body: serde_json::Value) {
-    let Some(run) = RUN.get() else {
-        return;
-    };
+async fn post(base: &str, token: &str, body: serde_json::Value) {
     let Ok(client) = reqwest::Client::builder().timeout(TIMEOUT).build() else {
         return;
     };
     let _ = client
-        .post(format!("{}/api/v1/client-events", run.base))
-        .bearer_auth(&run.token)
+        .post(format!("{base}/api/v1/client-events"))
+        .bearer_auth(token)
         .header(client_info::HEADER, client_info::header_value())
         .json(&body)
         .send()

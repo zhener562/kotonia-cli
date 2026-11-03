@@ -54,10 +54,103 @@ impl std::fmt::Display for HostExecutorError {
 
 impl std::error::Error for HostExecutorError {}
 
-/// Program used for `bash -c`. On unix this is simply `bash` from PATH.
+/// The shell agent commands run in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Shell {
+    /// `bash -c` (on Windows: Git Bash / MSYS2).
+    Bash(PathBuf),
+    /// `busybox sh -c`. The Windows fallback when no bash is installed, so the
+    /// app works straight after install; Git for Windows can come later.
+    Busybox(PathBuf),
+}
+
+impl Shell {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Shell::Bash(_) => "bash",
+            Shell::Busybox(_) => "busybox",
+        }
+    }
+
+    fn command(&self, script: &str) -> Command {
+        match self {
+            Shell::Bash(p) => {
+                let mut c = Command::new(p);
+                c.arg("-c").arg(script);
+                c
+            }
+            Shell::Busybox(p) => {
+                let mut c = Command::new(p);
+                c.arg("sh").arg("-c").arg(script);
+                c
+            }
+        }
+    }
+}
+
+/// `KOTONIA_BUSYBOX`, else a `busybox.exe` shipped next to this executable
+/// (the Windows zip and kotonia-desktop's install dir).
+fn busybox_program() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("KOTONIA_BUSYBOX") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?;
+    ["busybox.exe", "busybox64.exe"]
+        .iter()
+        .map(|n| dir.join(n))
+        .find(|p| p.is_file())
+}
+
+/// The shell agent commands run in. Resolved once per process.
+pub fn shell() -> Result<Shell, HostExecutorError> {
+    static SHELL: std::sync::OnceLock<Option<Shell>> = std::sync::OnceLock::new();
+    SHELL.get_or_init(resolve_shell).clone().ok_or_else(|| {
+        HostExecutorError::Spawn(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            NO_SHELL_MESSAGE,
+        ))
+    })
+}
+
+/// `bash` / `busybox`, or None when no shell could be found.
+pub fn shell_kind() -> Option<&'static str> {
+    shell().ok().map(|s| s.kind())
+}
+
+/// Also the text `telemetry::failure_kind` recognises as `no_shell`.
+pub const NO_SHELL_MESSAGE: &str =
+    "no shell found: no win32 bash.exe (System32's bash.exe is the WSL launcher and \
+     is skipped on purpose) and no busybox.exe. Install Git for Windows \
+     (https://gitforwindows.org), or point KOTONIA_BASH at a bash.exe";
+
+/// `KOTONIA_SHELL=busybox` forces the fallback (how it is tried on a machine
+/// that has bash).
+fn forced_busybox() -> bool {
+    std::env::var("KOTONIA_SHELL").is_ok_and(|v| v.eq_ignore_ascii_case("busybox"))
+}
+
+/// On unix `bash` from PATH.
 #[cfg(not(windows))]
-fn bash_program() -> Result<PathBuf, HostExecutorError> {
-    Ok(PathBuf::from("bash"))
+fn resolve_shell() -> Option<Shell> {
+    if forced_busybox() {
+        return busybox_program().map(Shell::Busybox);
+    }
+    Some(Shell::Bash(PathBuf::from("bash")))
+}
+
+/// Git Bash / MSYS2 first, then the busybox shipped with the app.
+#[cfg(windows)]
+fn resolve_shell() -> Option<Shell> {
+    if forced_busybox() {
+        return busybox_program().map(Shell::Busybox);
+    }
+    find_win32_bash()
+        .map(Shell::Bash)
+        .or_else(|| busybox_program().map(Shell::Busybox))
 }
 
 /// On Windows, plain `Command::new("bash")` is a trap: PATH usually resolves
@@ -66,19 +159,6 @@ fn bash_program() -> Result<PathBuf, HostExecutorError> {
 /// of the env vars set below propagate without WSLENV) — or fail outright
 /// when WSL has no distro installed. Resolve a win32 bash (Git Bash / MSYS2)
 /// instead, skipping the WSL launcher explicitly.
-#[cfg(windows)]
-fn bash_program() -> Result<PathBuf, HostExecutorError> {
-    static BASH: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
-    BASH.get_or_init(find_win32_bash).clone().ok_or_else(|| {
-        HostExecutorError::Spawn(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "no win32 bash.exe found (System32's bash.exe is the WSL launcher and is \
-             skipped on purpose). Install Git for Windows (https://gitforwindows.org) \
-             or point KOTONIA_BASH at a bash.exe",
-        ))
-    })
-}
-
 #[cfg(windows)]
 fn find_win32_bash() -> Option<PathBuf> {
     // Explicit override first — also the escape hatch for whoever really
@@ -298,6 +378,8 @@ fn save_full_output(combined: &str) -> Option<PathBuf> {
 pub struct HostExecutor {
     cwd: PathBuf,
     timeout: Duration,
+    /// Overrides the process-wide [`shell`] (tests).
+    shell: Option<Shell>,
 }
 
 impl HostExecutor {
@@ -305,7 +387,13 @@ impl HostExecutor {
         Self {
             cwd: cwd.into(),
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+            shell: None,
         }
+    }
+
+    pub fn with_shell(mut self, shell: Shell) -> Self {
+        self.shell = Some(shell);
+        self
     }
 
     pub fn with_timeout(mut self, d: Duration) -> Self {
@@ -321,10 +409,12 @@ impl HostExecutor {
     /// so it can use pipes, redirections, and shell built-ins without
     /// worrying about which command runner is in front.
     pub async fn bash(&self, command: &str) -> Result<ExecutionResult, HostExecutorError> {
-        let mut cmd = Command::new(bash_program()?);
-        cmd.arg("-c")
-            .arg(command)
-            .current_dir(&self.cwd)
+        let shell = match &self.shell {
+            Some(s) => s.clone(),
+            None => shell()?,
+        };
+        let mut cmd = shell.command(command);
+        cmd.current_dir(&self.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -500,6 +590,38 @@ fn append_capped(buf: &mut String, line: &str, truncated: &mut bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Windows fallback: commands the agent commonly writes, run through
+    /// `busybox sh -c`. Runs when `KOTONIA_BUSYBOX` points at a busybox
+    /// (`/usr/bin/busybox` on Linux, busybox-w64 on the Windows CI runner).
+    #[tokio::test]
+    async fn busybox_shell_runs_common_commands() {
+        let Some(bb) = std::env::var_os("KOTONIA_BUSYBOX") else {
+            eprintln!("KOTONIA_BUSYBOX not set; skipping");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "alpha 1\nbeta 2\ngamma 3\n").unwrap();
+        let exec = HostExecutor::new(dir.path()).with_shell(Shell::Busybox(PathBuf::from(bb)));
+        for (cmd, want) in [
+            ("echo hi", "hi"),
+            ("ls", "notes.txt"),
+            ("cat notes.txt | grep beta", "beta 2"),
+            ("sed -n 3p notes.txt", "gamma 3"),
+            ("awk '{s+=$2} END {print s}' notes.txt", "6"),
+            ("wc -l < notes.txt", "3"),
+            ("find . -name '*.txt' | head -1", "notes.txt"),
+            ("mkdir -p a/b && echo x > a/b/c.txt && cat a/b/c.txt", "x"),
+            ("for f in *.txt; do echo \"got $f\"; done", "got notes.txt"),
+            ("if [ -f notes.txt ]; then echo yes; fi", "yes"),
+            ("printf '%s-%s\\n' a b", "a-b"),
+            ("sort -r notes.txt | head -1", "gamma 3"),
+        ] {
+            let r = exec.bash(cmd).await.unwrap();
+            assert_eq!(r.exit_code, 0, "{cmd}: {}", r.combined);
+            assert!(r.combined.contains(want), "{cmd}: {}", r.combined);
+        }
+    }
 
     #[tokio::test]
     async fn stored_secrets_never_reach_the_observation() {
@@ -703,7 +825,10 @@ mod tests {
     fn win32_bash_resolves_and_is_not_wsl_launcher() {
         // GitHub's windows runners (and any Git-for-Windows host) ship a real
         // bash, so resolution must succeed and must not be the WSL launcher.
-        let bash = bash_program().expect("win32 bash should resolve on a Git-for-Windows host");
+        let bash = match shell().expect("a shell should resolve on a Git-for-Windows host") {
+            Shell::Bash(p) => p,
+            Shell::Busybox(_) => panic!("expected Git Bash on the Windows CI host"),
+        };
         assert!(
             bash.is_file(),
             "resolved bash must exist: {}",
