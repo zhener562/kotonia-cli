@@ -3,6 +3,7 @@ pub mod approval;
 pub mod claude_code;
 pub mod compaction;
 pub mod dispatch;
+pub mod edit;
 pub mod history;
 pub mod parse;
 pub mod prompt;

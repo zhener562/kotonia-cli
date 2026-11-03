@@ -1504,14 +1504,127 @@ complete arguments; if you were writing a long script, write it in smaller steps
                 }
             }
             "memory" if self.memory.is_some() => self.memory_call(input, approval, sink),
+            "edit_file" => self.edit_call(input, approval, sink),
             other => Ok((
                 format!(
-                    "Unknown tool: `{other}`. Available tools: bash, web_search, \
+                    "Unknown tool: `{other}`. Available tools: bash, edit_file, web_search, \
                      fetch_url, inspect_image, final_answer."
                 ),
                 true,
             )),
         }
+    }
+
+    /// `edit_file`. Same policy as a shell write: inside the workspace it
+    /// runs under `allowlist`, outside it asks; `all` always asks. Memory,
+    /// grants and the vault are refused in every mode, as for bash.
+    fn edit_call(
+        &mut self,
+        input: &serde_json::Value,
+        approval: &mut dyn ApprovalHandler,
+        sink: &mut dyn EventSink,
+    ) -> Result<(String, bool), AgentError> {
+        let s = |k: &str| {
+            input
+                .get(k)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        let (raw_path, old, new) = (s("path"), s("old_text"), s("new_text"));
+        let replace_all = input
+            .get("replace_all")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if raw_path.trim().is_empty() {
+            return Ok(("edit_file needs a `path`".into(), true));
+        }
+        let path = {
+            let p = Path::new(raw_path.trim());
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                self.executor.cwd().join(p)
+            }
+        };
+        let path_str = path.to_string_lossy().to_string();
+        let short = |t: &str| -> String {
+            let one: String = t.chars().take(80).collect::<String>().replace('\n', "⏎");
+            if t.chars().count() > 80 {
+                format!("{one}…")
+            } else {
+                one
+            }
+        };
+        let label = if old.is_empty() {
+            format!("edit_file {raw_path} (new file)")
+        } else {
+            format!(
+                "edit_file {raw_path}: {:?} → {:?}",
+                short(&old),
+                short(&new)
+            )
+        };
+
+        let refused = if crate::vault::command_touches_vault(&path_str) {
+            Some("the secret vault is off-limits to the agent".to_string())
+        } else {
+            self.bash_refusal(&path_str)
+        };
+        if let Some(reason) = refused {
+            sink.emit(Event::BashSkipped {
+                command: label,
+                reason: reason.clone(),
+            });
+            return Ok((format!("Refused without running: {reason}."), true));
+        }
+        let ask = match self.config.approval {
+            ApprovalMode::Auto => None,
+            ApprovalMode::All => Some("approval mode = all".to_string()),
+            ApprovalMode::Allowlist if is_within(&path, self.executor.cwd()) => None,
+            ApprovalMode::Allowlist => Some("edit outside the workspace".to_string()),
+        };
+        if let Some(reason) = ask {
+            if approval.ask(&label, &reason) != ApprovalOutcome::Approve {
+                sink.emit(Event::BashSkipped {
+                    command: label,
+                    reason: format!("operator denied ({reason})"),
+                });
+                return Ok((
+                    format!(
+                        "Operator DENIED that edit (reason: {reason}). Try a different approach \
+                         or stop with a final answer explaining what you're stuck on."
+                    ),
+                    true,
+                ));
+            }
+        }
+        sink.emit(Event::Bash { command: label });
+        let (text, is_error) = match super::edit::apply_edit(&path, &old, &new, replace_all) {
+            Ok(o) if o.created => (format!("created {raw_path}\n{}", o.snippet), false),
+            Ok(o) => (
+                format!(
+                    "edited {raw_path} ({} replacement{})\n{}",
+                    o.replacements,
+                    if o.replacements == 1 { "" } else { "s" },
+                    o.snippet
+                ),
+                false,
+            ),
+            Err(e) => (format!("[error] {e}"), true),
+        };
+        let result = ExecutionResult {
+            exit_code: if is_error { 1 } else { 0 },
+            timed_out: false,
+            truncated: false,
+            combined: text,
+            full_output_path: None,
+        };
+        sink.emit(Event::Observation {
+            result: result.clone(),
+        });
+        self.history_append_observation(&result);
+        Ok((result.as_observation(), is_error))
     }
 
     /// The `memory` tool. Writes go straight through, except after the
@@ -1760,6 +1873,24 @@ fn build_tool_catalog() -> Vec<AiTool> {
             }),
         },
         AiTool {
+            name: "edit_file".to_string(),
+            description: "Change part of a text file: `old_text` must appear exactly once \
+                          (or set `replace_all`) and is replaced by `new_text`. An empty \
+                          `old_text` creates a new file. Returns the edited lines with line \
+                          numbers. Prefer this to rewriting whole files from the shell."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path, relative to the workspace or absolute."},
+                    "old_text": {"type": "string", "description": "Exact text to replace, indentation included. Empty to create a new file."},
+                    "new_text": {"type": "string", "description": "Replacement text (may be empty to delete)."},
+                    "replace_all": {"type": "boolean", "description": "Replace every occurrence instead of requiring one."}
+                },
+                "required": ["path", "old_text", "new_text"]
+            }),
+        },
+        AiTool {
             name: "web_search".to_string(),
             description: "Search the web via the local Searxng instance \
                           (aggregates Google / Bing / DuckDuckGo, no API \
@@ -1911,6 +2042,35 @@ fn mail_tools() -> Vec<AiTool> {
             }),
         },
     ]
+}
+
+/// True when `path` (which may not exist yet) is inside `root`, after
+/// resolving symlinks and `..` on the part that exists.
+fn is_within(path: &Path, root: &Path) -> bool {
+    let Ok(root) = std::fs::canonicalize(root) else {
+        return false;
+    };
+    let mut existing = path.to_path_buf();
+    let mut rest = Vec::new();
+    while !existing.exists() {
+        match (existing.file_name(), existing.parent()) {
+            (Some(name), Some(parent)) => {
+                rest.push(name.to_os_string());
+                existing = parent.to_path_buf();
+            }
+            _ => return false,
+        }
+    }
+    let Ok(mut resolved) = std::fs::canonicalize(&existing) else {
+        return false;
+    };
+    for part in rest.iter().rev() {
+        if part == ".." {
+            return false;
+        }
+        resolved.push(part);
+    }
+    resolved.starts_with(&root)
 }
 
 /// True when a shell command reads mail through `kotonia-cli mail`.
@@ -2162,6 +2322,19 @@ impl std::error::Error for AgentError {}
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn within_workspace_resolves_dotdot_and_new_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().join("ws");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        assert!(is_within(&ws.join("src/new.rs"), &ws));
+        assert!(is_within(&ws.join("a/b/new.rs"), &ws));
+        assert!(!is_within(&ws.join("../outside.rs"), &ws));
+        assert!(!is_within(&ws.join("src/../../outside.rs"), &ws));
+        assert!(!is_within(&ws.join("nope/../../x"), &ws));
+        assert!(!is_within(Path::new("/etc/hosts"), &ws));
+    }
 
     #[test]
     fn shell_mail_is_recognised() {

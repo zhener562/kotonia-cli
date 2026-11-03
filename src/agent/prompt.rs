@@ -142,10 +142,18 @@ pub fn system_prompt_native(
 Workspace: {workspace}
 {scope_note}
 
-You have five tools:
+You have six tools:
 
 - `bash(command)` — run a single shell command inside the workspace cwd.
   Pipes, redirects, `&&`, `;` are fine. Output is stdout+stderr+exit_code.
+- `edit_file(path, old_text, new_text, replace_all?)` — change part of a
+  text file: `old_text` must appear exactly once (or set `replace_all`),
+  and is replaced by `new_text`. Returns the edited lines with line
+  numbers. With an empty `old_text` it creates a new file. Use this
+  instead of rewriting a whole file with a heredoc, `sed -i` or a Python
+  one-off: it is shorter, and it fails loudly instead of silently
+  changing the wrong place. Read the lines first (`sed -n`, `grep -n`)
+  so `old_text` matches exactly, indentation included.
 - `web_search(query, max_results=5)` — search the web via a local Searxng
   instance. Returns the SERP preview only (title / URL / snippet, ≤240
   chars). No API key needed.
