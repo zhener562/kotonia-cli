@@ -344,7 +344,7 @@ When you are logged in to kotonia.ai (`kotonia-cli login`, or
 and `end` — to the kotonia.ai server only, so we can see where runs fail
 before they ever reach a model (no `claude` binary, missing API key,
 worktree trouble). Requests to kotonia.ai also carry an
-`x-kotonia-client` header like `cli/0.1.13 (linux-x86_64; wsl)`.
+`x-kotonia-client` header like `cli/0.1.14 (linux-x86_64; wsl)`.
 
 What is sent: a random per-run id, the engine (`react` / `claude-code`),
 whether the model is kotonia's, how the run was driven (one-shot / REPL /
