@@ -191,6 +191,11 @@ pub struct AgentConfig {
     /// agent carry data out in a URL or query. Under allowlist, `curl` and
     /// `wget` were already gated; this closes the same door for the tools.
     pub unattended: bool,
+    /// Load this folder's memory and the user's profile (see
+    /// `crate::project`). On by default so every caller — the CLI, the
+    /// daemon, kotonia-desktop — gets it from here rather than wiring it
+    /// itself. Skipped when the workspace is the home directory.
+    pub project_memory: bool,
 }
 
 impl AgentConfig {
@@ -205,6 +210,7 @@ impl AgentConfig {
             persona_prefix: None,
             connectors: false,
             unattended: false,
+            project_memory: true,
         }
     }
 }
@@ -252,6 +258,34 @@ pub struct Agent {
     /// LLM calls still complete first — that's the "coarse" tradeoff). Reset
     /// to `false` at the start of every `run_turn`.
     cancel: Arc<AtomicBool>,
+    /// This folder's memory (`crate::project`); None when disabled or when
+    /// the workspace is the home directory.
+    memory: Option<crate::project::ProjectMemory>,
+    home: Option<crate::home::workspace::HomeDir>,
+    /// `~/.kotonia/projects`, so bash can be kept away from it even when
+    /// `memory` is None (the heartbeat).
+    memory_base: Option<std::path::PathBuf>,
+    mail_access: MailAccess,
+    /// Set once text from outside (mail, web) entered the conversation.
+    /// From then on, memory writes ask the user first: that text could
+    /// otherwise plant an instruction that every later session obeys.
+    tainted: Option<&'static str>,
+}
+
+/// Which mail accounts this session may read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MailAccess {
+    None,
+    /// The resident agent (`connectors`): every connected account.
+    All,
+    /// A folder the user granted these accounts to.
+    Only(Vec<String>),
+}
+
+impl MailAccess {
+    fn enabled(&self) -> bool {
+        !matches!(self, MailAccess::None)
+    }
 }
 
 impl Agent {
@@ -264,6 +298,43 @@ impl Agent {
         } else {
             system_prompt(workspace_root, config.in_place, kotonia_base)
         };
+        let home = crate::home::workspace::HomeDir::resolve().ok();
+        let memory_base = crate::project::projects_base().ok();
+        let memory = if config.project_memory
+            && !home
+                .as_ref()
+                .is_some_and(|h| crate::project::is_inside_home(workspace_root, h))
+        {
+            crate::project::ProjectMemory::resolve(workspace_root).ok()
+        } else {
+            None
+        };
+        let mail_access = if config.connectors {
+            MailAccess::All
+        } else {
+            match memory.as_ref().map(|m| m.mail_grants()) {
+                Some(ids) if !ids.is_empty() => MailAccess::Only(ids),
+                _ => MailAccess::None,
+            }
+        };
+        let base_prompt = match &memory {
+            Some(memory) => {
+                memory.note_root();
+                // `connectors` marks the resident agent, whose prefix already
+                // starts with the home files (USER.md included).
+                let profile = if config.connectors {
+                    None
+                } else {
+                    home.as_ref()
+                };
+                let mut block = memory.prompt_block(profile, native_mode);
+                if let MailAccess::Only(ids) = &mail_access {
+                    block.push_str(&granted_mail_section(ids, native_mode));
+                }
+                format!("{base_prompt}\n\n{block}")
+            }
+            None => base_prompt,
+        };
         let system_prompt_text = match config.persona_prefix.as_deref() {
             Some(prefix) if !prefix.trim().is_empty() => {
                 format!("{}\n\n---\n\n{}", prefix.trim(), base_prompt)
@@ -275,7 +346,12 @@ impl Agent {
             let mut tools = build_tool_catalog();
             if config.connectors {
                 tools.push(request_connector_tool());
+            }
+            if mail_access.enabled() {
                 tools.extend(mail_tools());
+            }
+            if memory.is_some() {
+                tools.push(memory_tool(home.is_some()));
             }
             tools
         } else {
@@ -296,6 +372,11 @@ impl Agent {
             turn_start_native: 0,
             turn_start_chat: 0,
             cancel: Arc::new(AtomicBool::new(false)),
+            memory,
+            home,
+            memory_base,
+            mail_access,
+            tainted: None,
         }
     }
 
@@ -319,7 +400,45 @@ impl Agent {
     /// prompt that `new()` installed stays in place — only the previous
     /// user/assistant exchange is appended after it.
     pub fn seed_messages(&mut self, prior: Vec<ChatMsg>) {
+        // A resumed session that read mail still has it in context. (Web
+        // pages carry no marker, so they are not detected here.)
+        if prior
+            .iter()
+            .any(|m| m.content.contains("UNTRUSTED EMAIL CONTENT"))
+        {
+            self.tainted = Some("mail (earlier in this session)");
+        }
         self.messages.extend(prior);
+    }
+
+    /// Why a bash command is refused before the approval policy sees it,
+    /// if it is. Applies in every approval mode, like the vault check.
+    fn bash_refusal(&self, command: &str) -> Option<String> {
+        if let Some(base) = &self.memory_base {
+            if crate::project::command_touches_memory(command, base, self.home.as_ref()) {
+                return Some(if self.memory.is_some() && self.native_mode {
+                    "the memory files are reachable only through the `memory` tool".to_string()
+                } else {
+                    "the memory files cannot be changed from the shell".to_string()
+                });
+            }
+        }
+        if self.mail_access != MailAccess::All && runs_kotonia_mail(command) {
+            return Some(match self.mail_access {
+                MailAccess::Only(_) => "use the mail_* tools, not the shell".to_string(),
+                _ => "mail is not enabled for this folder; the user can allow an account \
+                      with `kotonia-cli project allow-mail <connector id>`"
+                    .to_string(),
+            });
+        }
+        None
+    }
+
+    /// Remember that outside text entered the conversation.
+    fn note_untrusted_input(&mut self, source: &'static str) {
+        if self.tainted.is_none() {
+            self.tainted = Some(source);
+        }
     }
 
     /// Log the freshly-installed system prompt to history. Call once after
@@ -472,7 +591,13 @@ impl Agent {
                     return Ok(answer);
                 }
                 Action::Bash(command) => {
-                    let decision = decide(self.config.approval, &command);
+                    let decision = match self.bash_refusal(&command) {
+                        Some(reason) => Decision::Refuse { reason },
+                        None => decide(self.config.approval, &command),
+                    };
+                    if fetches_outside_text(&command) {
+                        self.note_untrusted_input("a shell download");
+                    }
                     let allow = match decision {
                         Decision::Allow => true,
                         Decision::Refuse { reason } => {
@@ -1037,6 +1162,11 @@ complete arguments; if you were writing a long script, write it in smaller steps
             ));
         }
         match name {
+            "web_search" | "fetch_url" => self.note_untrusted_input("a web page"),
+            "mail_recent" | "mail_read" | "mail_search" => self.note_untrusted_input("mail"),
+            _ => {}
+        }
+        match name {
             "bash" => {
                 let command = input
                     .get("command")
@@ -1046,7 +1176,13 @@ complete arguments; if you were writing a long script, write it in smaller steps
                 if command.trim().is_empty() {
                     return Ok(("bash tool called with empty `command`".into(), true));
                 }
-                let decision = decide(self.config.approval, &command);
+                let decision = match self.bash_refusal(&command) {
+                    Some(reason) => Decision::Refuse { reason },
+                    None => decide(self.config.approval, &command),
+                };
+                if fetches_outside_text(&command) {
+                    self.note_untrusted_input("a shell download");
+                }
                 let allow = match decision {
                     Decision::Allow => true,
                     Decision::Refuse { reason } => {
@@ -1292,13 +1428,17 @@ complete arguments; if you were writing a long script, write it in smaller steps
                     }
                 }
             }
-            "mail_recent" | "mail_read" | "mail_search" if self.config.connectors => {
+            "mail_recent" | "mail_read" | "mail_search" if self.mail_access.enabled() => {
                 let connector = input.get("connector").and_then(|v| v.as_str());
                 let label = format!("{name} {input}");
                 sink.emit(Event::Bash {
                     command: label.clone(),
                 });
-                let text = match run_mail_tool(name, input, connector).await {
+                let allowed = match &self.mail_access {
+                    MailAccess::Only(ids) => Some(ids.as_slice()),
+                    _ => None,
+                };
+                let text = match run_mail_tool(name, input, connector, allowed).await {
                     Ok(t) => t,
                     Err(e) => format!("[error] {e}"),
                 };
@@ -1363,6 +1503,7 @@ complete arguments; if you were writing a long script, write it in smaller steps
                     )),
                 }
             }
+            "memory" if self.memory.is_some() => self.memory_call(input, approval, sink),
             other => Ok((
                 format!(
                     "Unknown tool: `{other}`. Available tools: bash, web_search, \
@@ -1371,6 +1512,114 @@ complete arguments; if you were writing a long script, write it in smaller steps
                 true,
             )),
         }
+    }
+
+    /// The `memory` tool. Writes go straight through, except after the
+    /// session has read outside text: then the user sees the note first.
+    fn memory_call(
+        &mut self,
+        input: &serde_json::Value,
+        approval: &mut dyn ApprovalHandler,
+        sink: &mut dyn EventSink,
+    ) -> Result<(String, bool), AgentError> {
+        use crate::project::{MemoryEdit, MemoryFile};
+        let s = |k: &str| {
+            input
+                .get(k)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+        let (action, file_name, text, old) = (s("action"), s("file"), s("text"), s("old"));
+        let Some(file) = MemoryFile::parse(&file_name) else {
+            return Ok((
+                format!(
+                    "Unknown memory file `{file_name}`. Use one of: {}.",
+                    MemoryFile::NAMES.join(", ")
+                ),
+                true,
+            ));
+        };
+        let edit = match action.as_str() {
+            "read" => MemoryEdit::Read,
+            "append" => MemoryEdit::Append(text.clone()),
+            "replace" => MemoryEdit::Replace {
+                old: old.clone(),
+                new: text.clone(),
+            },
+            "rewrite" => MemoryEdit::Rewrite(text.clone()),
+            other => {
+                return Ok((
+                    format!("Unknown memory action `{other}`: read, append, replace or rewrite."),
+                    true,
+                ))
+            }
+        };
+        if matches!(edit, MemoryEdit::Append(ref t) | MemoryEdit::Rewrite(ref t) if t.trim().is_empty())
+        {
+            return Ok(("Nothing to write: `text` is empty.".into(), true));
+        }
+        let preview = |t: &str| -> String {
+            let p: String = t.chars().take(300).collect();
+            if t.chars().count() > 300 {
+                format!("{p}…")
+            } else {
+                p
+            }
+        };
+        let label = match &edit {
+            MemoryEdit::Read => format!("memory read {file_name}"),
+            MemoryEdit::Replace { old, new } if new.is_empty() => {
+                format!("memory {file_name}: delete {:?}", preview(old))
+            }
+            MemoryEdit::Replace { old, new } => format!(
+                "memory {file_name}: replace {:?} with {:?}",
+                preview(old),
+                preview(new)
+            ),
+            MemoryEdit::Append(t) | MemoryEdit::Rewrite(t) => {
+                format!("memory {action} {file_name}: {:?}", preview(t))
+            }
+        };
+        if edit.writes() {
+            if let Some(source) = self.tainted {
+                let reason = format!(
+                    "this session has read {source}; check the note is yours, not something \
+                     that text told the agent to remember"
+                );
+                if approval.ask(&label, &reason) != ApprovalOutcome::Approve {
+                    sink.emit(Event::BashSkipped {
+                        command: label,
+                        reason: reason.clone(),
+                    });
+                    return Ok((
+                        "The user did not approve saving that note. Do not retry it in this \
+                         session; mention it in your answer if it matters."
+                            .to_string(),
+                        true,
+                    ));
+                }
+            }
+        }
+        sink.emit(Event::Bash { command: label });
+        let memory = self.memory.as_ref().expect("guarded by the match arm");
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let (text, is_error) = match memory.apply(self.home.as_ref(), file, &edit, &today) {
+            Ok(t) => (t, false),
+            Err(e) => (format!("[error] {e}"), true),
+        };
+        let result = ExecutionResult {
+            exit_code: if is_error { 1 } else { 0 },
+            timed_out: false,
+            truncated: false,
+            combined: text,
+            full_output_path: None,
+        };
+        sink.emit(Event::Observation {
+            result: result.clone(),
+        });
+        self.history_append_observation(&result);
+        Ok((result.as_observation(), is_error))
     }
 
     /// Resolve `path` against the agent's workspace cwd (same policy as
@@ -1664,16 +1913,97 @@ fn mail_tools() -> Vec<AiTool> {
     ]
 }
 
+/// True when a shell command reads mail through `kotonia-cli mail`.
+fn runs_kotonia_mail(command: &str) -> bool {
+    let words: Vec<&str> = command
+        .split(|c: char| c.is_whitespace() || matches!(c, ';' | '|' | '&' | '(' | ')' | '`'))
+        .filter(|w| !w.is_empty())
+        .map(|w| w.trim_matches(|c| c == '"' || c == '\''))
+        .collect();
+    words
+        .windows(2)
+        .any(|w| (w[0] == "kotonia-cli" || w[0].ends_with("/kotonia-cli")) && w[1] == "mail")
+}
+
+/// True when a shell command pulls text from outside (a web page, mail).
+fn fetches_outside_text(command: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    ["curl ", "wget ", "fetch-url ", "web-search "]
+        .iter()
+        .any(|n| lower.contains(n))
+        || runs_kotonia_mail(command)
+}
+
+/// The mail block for a folder the user granted accounts to.
+fn granted_mail_section(ids: &[String], native: bool) -> String {
+    let list = ids
+        .iter()
+        .map(|id| format!("`{id}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut out = format!(
+        "\n# Mail\n\nThe user allowed this folder to read mail from: {list}. No other account \
+is available here.\n"
+    );
+    if native {
+        out.push_str(&crate::connectors::mail_usage());
+    } else {
+        out.push_str("Mail tools are not available in this mode.\n");
+    }
+    out
+}
+
+/// The `memory` tool (see `crate::project`).
+fn memory_tool(with_user: bool) -> AiTool {
+    let files: Vec<&str> = if with_user {
+        vec!["folder", "daily", "user"]
+    } else {
+        vec!["folder", "daily"]
+    };
+    AiTool {
+        name: "memory".to_string(),
+        description: "Read or change your notes that carry over between sessions. `folder` = \
+                      durable facts about this folder, `daily` = today's notes, `user` = what \
+                      holds about the user everywhere. `append` adds a line, `replace` swaps \
+                      the one occurrence of `old` for `text` (empty `text` deletes it), \
+                      `rewrite` replaces the whole file when tidying."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["read", "append", "replace", "rewrite"]},
+                "file": {"type": "string", "enum": files},
+                "text": {"type": "string", "description": "append/rewrite: the text. replace: the new text; empty deletes."},
+                "old": {"type": "string", "description": "replace only: the exact text to change; must occur once."}
+            },
+            "required": ["action", "file"]
+        }),
+    }
+}
+
 async fn run_mail_tool(
     name: &str,
     input: &serde_json::Value,
     connector: Option<&str>,
+    allowed: Option<&[String]>,
 ) -> Result<String, String> {
     use crate::connectors::{mail, Registry};
     let registry = Registry::load()?;
-    let record = match connector {
-        Some(id) => registry.connectors.get(id).cloned(),
-        None => registry.first_mail().cloned(),
+    if let (Some(id), Some(allowed)) = (connector, allowed) {
+        if !allowed.iter().any(|a| a == id) {
+            return Err(format!(
+                "`{id}` is not allowed in this folder (allowed: {})",
+                allowed.join(", ")
+            ));
+        }
+    }
+    let record = match (connector, allowed) {
+        (Some(id), _) => registry.connectors.get(id).cloned(),
+        (None, Some(allowed)) => allowed
+            .iter()
+            .find_map(|id| registry.connectors.get(id))
+            .cloned(),
+        (None, None) => registry.first_mail().cloned(),
     }
     .ok_or_else(|| {
         "no mail account is connected — call request_connector with connector \"gmail\" \
@@ -1832,6 +2162,19 @@ impl std::error::Error for AgentError {}
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn shell_mail_is_recognised() {
+        assert!(runs_kotonia_mail("kotonia-cli mail recent --new"));
+        assert!(runs_kotonia_mail(
+            "/home/u/.cargo/bin/kotonia-cli mail read 4 | head"
+        ));
+        assert!(runs_kotonia_mail("ls; \"kotonia-cli\" mail search x"));
+        assert!(!runs_kotonia_mail("kotonia-cli connector list"));
+        assert!(!runs_kotonia_mail("grep mail src/lib.rs"));
+        assert!(fetches_outside_text("curl -s https://example.com"));
+        assert!(!fetches_outside_text("cargo test"));
+    }
 
     #[test]
     fn sniff_image_recognises_real_formats() {

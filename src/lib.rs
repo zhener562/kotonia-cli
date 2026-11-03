@@ -16,6 +16,7 @@ pub mod execution;
 pub mod home;
 pub mod login;
 pub mod notifier;
+pub mod project;
 pub mod providers;
 pub mod serve;
 pub mod telemetry;

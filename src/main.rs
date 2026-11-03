@@ -114,6 +114,27 @@ enum Cmd {
     /// Websites the agent may open without asking — the only sites a
     /// background run (heartbeat) can reach at all.
     Web(WebArgs),
+
+    /// This folder's memory and what the agent may use here. Run inside
+    /// the folder (any subdirectory or worktree of a repo works).
+    Project(ProjectArgs),
+}
+
+#[derive(Args, Debug)]
+struct ProjectArgs {
+    #[command(subcommand)]
+    cmd: ProjectCmd,
+}
+
+#[derive(Subcommand, Debug)]
+enum ProjectCmd {
+    /// Where this folder's memory lives and which accounts it may use.
+    Show,
+    /// Let the agent read this mail account in this folder only
+    /// (connector id from `kotonia-cli connector list`).
+    AllowMail { connector: String },
+    /// Take a mail account away from this folder.
+    DenyMail { connector: String },
 }
 
 #[derive(Args, Debug)]
@@ -515,6 +536,7 @@ async fn real_main() -> ExitCode {
         Some(Cmd::Mail(args)) => return run_mail(args).await,
         Some(Cmd::Secret(args)) => return run_secret(args).await,
         Some(Cmd::Web(args)) => return run_web(args),
+        Some(Cmd::Project(args)) => return run_project(args),
         None => {}
     }
 
@@ -1037,6 +1059,63 @@ fn run_web(args: WebArgs) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("kotonia-cli web: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_project(args: ProjectArgs) -> ExitCode {
+    let result: Result<(), String> = (|| {
+        let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
+        let memory = kotonia_cli::project::ProjectMemory::resolve(&cwd)?;
+        match args.cmd {
+            ProjectCmd::Show => {
+                println!("folder:  {}", memory.root().display());
+                println!("memory:  {}", memory.dir().display());
+                let mail = memory.mail_grants();
+                if mail.is_empty() {
+                    println!("mail:    (none)");
+                } else {
+                    println!("mail:    {}", mail.join(", "));
+                }
+                Ok(())
+            }
+            ProjectCmd::AllowMail { connector } => {
+                let registry = kotonia_cli::connectors::Registry::load()?;
+                match registry.connectors.get(&connector) {
+                    Some(c)
+                        if matches!(
+                            c.kind,
+                            kotonia_cli::connectors::ConnectorKind::Imap { .. }
+                        ) => {}
+                    Some(_) => return Err(format!("`{connector}` is not a mail account")),
+                    None => {
+                        return Err(format!(
+                            "no connector `{connector}`; see `kotonia-cli connector list`"
+                        ))
+                    }
+                }
+                if memory.set_mail_grant(&connector, true)? {
+                    println!("{} may now read `{connector}`", memory.root().display());
+                } else {
+                    println!("already allowed");
+                }
+                Ok(())
+            }
+            ProjectCmd::DenyMail { connector } => {
+                if memory.set_mail_grant(&connector, false)? {
+                    println!("removed `{connector}` from {}", memory.root().display());
+                    Ok(())
+                } else {
+                    Err(format!("`{connector}` was not allowed here"))
+                }
+            }
+        }
+    })();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("kotonia-cli project: {e}");
             ExitCode::from(1)
         }
     }

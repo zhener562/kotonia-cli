@@ -110,6 +110,15 @@ One brief line unless it needs more.\n",
     ),
 ];
 
+/// The seed text a file starts with, so callers can tell "still the
+/// template" from "someone wrote something".
+pub fn template(name: &str) -> Option<&'static str> {
+    TEMPLATES
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, body)| *body)
+}
+
 #[derive(Debug, Clone)]
 pub struct HomeDir {
     root: PathBuf,
@@ -201,7 +210,9 @@ pub fn assemble_prompt_block(
 Your home directory is `{root}`. The files below are yours: they are how you \
 remember things between conversations. Edit them with bash when something is \
 worth keeping —\n\
-- durable facts about the user and decisions → MEMORY.md (or USER.md for who they are)\n\
+- durable facts and decisions → MEMORY.md\n\
+- who the user is (preferences, how they like to be talked to) → USER.md, with the `memory` \
+tool (`file: \"user\"`) — the shell cannot write USER.md\n\
 - notes from today → memory/<YYYY-MM-DD>.md\n\
 - how work gets done here → AGENTS.md; setup quirks → TOOLS.md\n\
 - recurring checks the user asks for → HEARTBEAT.md (one `- ` bullet per check)\n\
@@ -239,7 +250,7 @@ consider tidying it — this file is loaded into every conversation.)\n",
     out
 }
 
-fn truncate_chars(s: &str, max: usize) -> (&str, bool) {
+pub(crate) fn truncate_chars(s: &str, max: usize) -> (&str, bool) {
     match s.char_indices().nth(max) {
         Some((idx, _)) => (&s[..idx], true),
         None => (s, false),
