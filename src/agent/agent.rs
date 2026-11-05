@@ -175,7 +175,7 @@ pub struct AgentConfig {
     pub max_tokens: u32,
     pub in_place: bool,
     /// When set, the system prompt advertises the kotonia /api/v1 image /
-    /// audio / video endpoints (using `$KOTONIA_API_KEY` from the inherited
+    /// audio endpoints (using `$KOTONIA_API_KEY` from the inherited
     /// shell env). Leave None to hide the capability entirely.
     pub kotonia_api_base: Option<String>,
     /// Force the delimiter-based ReAct loop even when the backend supports

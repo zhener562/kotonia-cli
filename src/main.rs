@@ -511,7 +511,7 @@ async fn real_main() -> ExitCode {
     // (`Authorization: Bearer $KOTONIA_API_KEY`). Without this, a logged-in
     // user who never separately exported KOTONIA_API_KEY gets a working
     // chat model (the LLM call itself falls back to the device_token) but
-    // an agent that has no idea the images/audio/video API exists at all —
+    // an agent that has no idea the images/audio API exists at all —
     // it just hallucinates a made-up local endpoint instead. Mirrors
     // kotonia-desktop's `main.rs`, which does the same bridge.
     if let Some(cfg) = daemon_config::load() {
@@ -1483,7 +1483,7 @@ fn print_banner(
     if kotonia_api {
         let base =
             std::env::var("KOTONIA_API_BASE").unwrap_or_else(|_| "https://kotonia.ai".to_string());
-        eprintln!("  kotonia   : {base}/api/v1  (image/audio/video tools enabled)");
+        eprintln!("  kotonia   : {base}/api/v1  (image/audio tools enabled)");
     }
     eprintln!("─────────────────────────────────────────────");
 }

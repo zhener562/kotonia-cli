@@ -7,7 +7,7 @@
 //!
 //! When `KOTONIA_API_KEY` is present in the environment, the prompt
 //! grows a "Generation API" section telling the model it can call the
-//! kotonia.ai `/api/v1` image / audio / video endpoints via curl. The
+//! kotonia.ai `/api/v1` image / audio endpoints via curl. The
 //! key passes through `bash -c` automatically (Command inherits env), so
 //! no extra wiring is needed beyond the prompt itself.
 
@@ -237,7 +237,7 @@ fn kotonia_api_section_native(base: &str) -> String {
         r#"
 # Generation API (kotonia.ai)
 
-You can call the kotonia media API for images, speech, and short video.
+You can call the kotonia media API for images and speech.
 Auth is `Authorization: Bearer $KOTONIA_API_KEY`; the env var is already
 exported into your bash shell. Base URL: `{base}/api/v1`.
 
@@ -249,8 +249,6 @@ Endpoints (OpenAI-compatible naming, JSON):
 
 - `POST /images/generations`  → HiDream image gen. Synchronous, ~30s.
 - `POST /audio/generations`   → VoxCPM2 speech. Synchronous, ~200ms.
-- `POST /videos/generations`  → LTX-2 short video. Async, returns job id.
-- `GET  /videos/generations/{{id}}` → poll the video job until `completed`.
 
 Call them through `bash` with curl — same shape as you'd use from any
 OpenAI SDK. Example:
@@ -293,7 +291,7 @@ fn kotonia_api_section(base: &str) -> String {
         r#"
 # Generation API (kotonia.ai)
 
-You can call the kotonia media API for images, speech, and short video.
+You can call the kotonia media API for images and speech.
 Auth is `Authorization: Bearer $KOTONIA_API_KEY`; the env var is already
 exported into your bash shell. Base URL: `{base}/api/v1`.
 
@@ -305,8 +303,6 @@ Endpoints (OpenAI-compatible naming, JSON):
 
 - `POST /images/generations`  → HiDream image gen. Synchronous, ~30s.
 - `POST /audio/generations`   → VoxCPM2 speech. Synchronous, ~200ms.
-- `POST /videos/generations`  → LTX-2 short video. Async, returns job id.
-- `GET  /videos/generations/{{id}}` → poll the video job until `completed`.
 
 ## Image example
 
@@ -352,35 +348,8 @@ curl -sS -X POST "{base}/api/v1/audio/generations" \
   | jq -r '.audio.b64' | base64 -d > ./hello.wav && ls -l ./hello.wav
 {BASH_CLOSE}
 
-## Video example (async, two-step)
-
-Submit the job:
-
-{BASH_OPEN}
-curl -sS -X POST "{base}/api/v1/videos/generations" \
-  -H "Authorization: Bearer $KOTONIA_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{{"prompt":"slow camera push toward a quiet sea","width":768,"height":512,"num_frames":49}}'
-{BASH_CLOSE}
-
-(grab the `id`, then poll — typically completes in 60-90s)
-
-{BASH_OPEN}
-JOB=<id-from-previous-step>; while :; do
-  R=$(curl -sS "{base}/api/v1/videos/generations/$JOB" \
-       -H "Authorization: Bearer $KOTONIA_API_KEY")
-  S=$(jq -r .status <<<"$R")
-  echo "$S"
-  case "$S" in completed|failed) echo "$R"; break ;; esac
-  sleep 5
-done
-{BASH_CLOSE}
-
-When the job is `completed`, its `data[].url` is a relative path on
-`{base}` — fetch it with another curl + Authorization header.
-
-Use these tools when the operator asks for an image / voice line / short
-clip. Otherwise stick to plain bash.
+Use these tools when the operator asks for an image / voice line.
+Otherwise stick to plain bash.
 "#,
         base = base,
         BASH_OPEN = BASH_OPEN,
