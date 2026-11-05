@@ -68,6 +68,14 @@ pub enum WireEvent {
     Bash {
         command: String,
     },
+    Browser {
+        action: String,
+        status: String,
+        url: String,
+        title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
     BashSkipped {
         command: String,
         reason: String,
@@ -115,6 +123,19 @@ impl WireEvent {
             Event::LlmThinking => Self::LlmThinking,
             Event::Text { text } => Self::Text { text },
             Event::Bash { command } => Self::Bash { command },
+            Event::Browser {
+                action,
+                status,
+                url,
+                title,
+                error,
+            } => Self::Browser {
+                action,
+                status,
+                url,
+                title,
+                error,
+            },
             Event::BashSkipped { command, reason } => Self::BashSkipped { command, reason },
             Event::Observation { result } => Self::Observation {
                 exit_code: result.exit_code,

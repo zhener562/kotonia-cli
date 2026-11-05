@@ -1462,7 +1462,7 @@ fn print_banner(
     eprintln!(
         "  tools     : {}",
         if agent.native_mode() {
-            "native (bash + web_search + fetch_url)"
+            "native (bash + web_search + fetch_url + browser)"
         } else {
             "delimiter (<<<BASH>>> + web-search + fetch-url CLI)"
         }
@@ -1898,6 +1898,18 @@ impl EventSink for StdoutSink {
             }
             Event::Bash { command } => {
                 println!("\n$ {command}");
+            }
+            Event::Browser {
+                action,
+                status,
+                url,
+                title,
+                error,
+            } => {
+                println!("\n[browser {action}: {status}] {title} {url}");
+                if let Some(error) = error {
+                    println!("{error}");
+                }
             }
             Event::ConnectorRequested { title, .. } => {
                 println!("\n[connector] {title} への接続を求めています");

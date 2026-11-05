@@ -16,7 +16,7 @@ A local shell agent driven by hosted or self-hosted LLMs. Two engines:
 ─────────────────────────────────────────────
 kotonia-cli
   model     : kotonia-llm-basic (kotonia)
-  tools     : native (bash + web_search + fetch_url)
+  tools     : native (bash + web_search + fetch_url + browser)
   approval  : allowlist
   workspace : /tmp/kotonia-agent-xyz  (worktree)
 ─────────────────────────────────────────────
@@ -66,6 +66,47 @@ Dependencies:
 
 Both tools degrade gracefully — `kotonia-cli` will keep working without
 them; only the matching tool call will return an error to the model.
+
+### Interactive browser
+
+The native ReAct engine includes a `browser` tool. Ask it to open a website,
+read a JavaScript page, fill a form, or compare information across tabs.
+It drives an installed Chrome, Chromium or Edge directly over a local CDP
+connection; no Python/Node sidecar or Browser Use cloud account is required.
+Set `KOTONIA_BROWSER_PATH` to the browser executable if automatic detection fails.
+A graphical desktop is required for normal use.
+
+The browser uses a separate temporary profile per conversation. Log in directly
+in its window, then tell the agent to continue. Passwords, one-time codes and
+payment credentials should be entered there, never in chat. Existing browser
+profiles are not imported; cookies/logins are discarded when this browser closes.
+Closing the browser window manually is fine; ask the agent to open it again.
+
+Available actions: `open`, `state`, `click`, `type` (replace field contents),
+`key`, `scroll`, `back`, `tabs`, `switch`, `screenshot` and `close`.
+State includes viewport text, numbered elements and a snapshot token; element
+actions require the latest token. The tool rejects stale/changed or covered
+elements. Screenshots are attached to the model when requested. Text typed into
+ordinary fields and page contents are sent to the configured model as context.
+Only the top document and open shadow roots are supported initially; embedded
+frames are listed so their pages can be opened directly when appropriate.
+
+In `allowlist` mode, navigation, clicks, typing and key presses require approval:
+even an ordinary button or Enter can submit a purchase. `all` confirms every
+action; `auto` skips these confirmations. Unattended/heartbeat agents cannot
+access the browser. Page contents are treated as untrusted input, including for
+memory writes. The Claude Code and legacy delimiter engines retain their own
+tool surfaces and do not receive this tool.
+
+Browser integration test (installed Chrome/Chromium required):
+
+```sh
+cargo test --lib chromium_round_trip -- --ignored --nocapture
+```
+
+This runs headless against a local fixture and checks Japanese input, submission,
+navigation, popups, scrolling, screenshots, secret-field masking, stale/covered
+elements and browser/profile cleanup.
 
 ## Authentication
 

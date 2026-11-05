@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod approval;
+pub mod browser;
 pub mod claude_code;
 pub mod compaction;
 pub mod dispatch;

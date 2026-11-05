@@ -142,7 +142,7 @@ pub fn system_prompt_native(
 Workspace: {workspace}
 {scope_note}
 
-You have six tools:
+Your base tools:
 
 - `bash(command)` — run a single shell command inside the workspace cwd.
   Pipes, redirects, `&&`, `;` are fine. Output is stdout+stderr+exit_code.
