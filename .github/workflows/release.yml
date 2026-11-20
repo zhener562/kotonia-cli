@@ -11,7 +11,12 @@ permissions:
 # busybox-w64 shipped in the Windows zip. Pinned by hash; take a new one only
 # once it has been public for 7 days (the repo's supply-chain rule).
 env:
-  BUSYBOX_URL: https://frippery.org/files/busybox/busybox-w64-FRP-6354-g5f09fb446.exe
+  # Our own mirror first (an unmodified copy plus its source, release
+  # `busybox-FRP-6354` of kotonia-cli): frippery.org returns 403 to some
+  # GitHub runners (2026-11-20, v0.1.17's Windows build failed 4 times).
+  # The hash check below is what makes either copy trustworthy.
+  BUSYBOX_URL: https://github.com/zhener562/kotonia-cli/releases/download/busybox-FRP-6354/busybox-w64-FRP-6354-g5f09fb446.exe
+  BUSYBOX_URL_UPSTREAM: https://frippery.org/files/busybox/busybox-w64-FRP-6354-g5f09fb446.exe
   BUSYBOX_SHA256: 95343c871869cc0ab57ecec26b2f9af0370eb9c954f7e5ddd017163e4e0d09a0
 
 jobs:
@@ -55,7 +60,7 @@ jobs:
       - name: Fetch busybox-w64
         shell: pwsh
         run: |
-          Invoke-WebRequest -Uri $env:BUSYBOX_URL -OutFile busybox.exe
+          try { Invoke-WebRequest -Uri $env:BUSYBOX_URL -OutFile busybox.exe } catch { Invoke-WebRequest -Uri $env:BUSYBOX_URL_UPSTREAM -OutFile busybox.exe }
           $hash = (Get-FileHash busybox.exe -Algorithm SHA256).Hash.ToLower()
           if ($hash -ne $env:BUSYBOX_SHA256) { throw "busybox sha256 mismatch: $hash" }
 
@@ -131,7 +136,7 @@ jobs:
           # busybox.exe next to the binary = commands work without Git for
           # Windows (host.rs falls back to it). GPLv2: the notice says where
           # its source is.
-          Invoke-WebRequest -Uri $env:BUSYBOX_URL -OutFile "$staging/busybox.exe"
+          try { Invoke-WebRequest -Uri $env:BUSYBOX_URL -OutFile "$staging/busybox.exe" } catch { Invoke-WebRequest -Uri $env:BUSYBOX_URL_UPSTREAM -OutFile "$staging/busybox.exe" }
           $bbhash = (Get-FileHash "$staging/busybox.exe" -Algorithm SHA256).Hash.ToLower()
           if ($bbhash -ne $env:BUSYBOX_SHA256) { throw "busybox sha256 mismatch: $bbhash" }
           Copy-Item "THIRD_PARTY_BUSYBOX.txt" "$staging/THIRD_PARTY_BUSYBOX.txt"
