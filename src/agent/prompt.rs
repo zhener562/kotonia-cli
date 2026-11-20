@@ -154,9 +154,9 @@ Your base tools:
   one-off: it is shorter, and it fails loudly instead of silently
   changing the wrong place. Read the lines first (`sed -n`, `grep -n`)
   so `old_text` matches exactly, indentation included.
-- `web_search(query, max_results=5)` — search the web via a local Searxng
-  instance. Returns the SERP preview only (title / URL / snippet, ≤240
-  chars). No API key needed.
+- `web_search(query, max_results=5)` — search the web. Returns the SERP
+  preview only (title / URL / snippet). There is a daily limit, so search
+  when it helps, not by reflex.
 - `fetch_url(url, max_chars?)` — download an http(s) URL and return its
   main article body as clean Markdown (boilerplate stripped). Use this
   when a search snippet isn't enough to answer the question. `max_chars`

@@ -1334,6 +1334,39 @@ complete arguments; if you were writing a long script, write it in smaller steps
                     .and_then(|v| v.as_u64())
                     .unwrap_or(5)
                     .clamp(1, 30);
+                // A local `web-search` (SearXNG wrapper) wins when it is on
+                // PATH — self-hosters keep their own search. Everyone else
+                // goes through kotonia.ai's /api/v1/search; before that
+                // existed the tool failed with "command not found" on every
+                // machine but the operator's.
+                if !command_on_path("web-search") {
+                    if let Some(base) = self.config.kotonia_api_base.clone() {
+                        let label = format!("web_search {}", shell_single_quote(&query));
+                        if let Some(denied) = self.gate_unattended_network(&label, approval, sink) {
+                            return Ok(denied);
+                        }
+                        sink.emit(Event::Bash { command: label });
+                        let (text, is_error) =
+                            match kotonia_web_search(&base, &query, max_results.min(10) as usize)
+                                .await
+                            {
+                                Ok(text) => (text, false),
+                                Err(e) => (format!("[error] {e}"), true),
+                            };
+                        let result = ExecutionResult {
+                            exit_code: if is_error { 1 } else { 0 },
+                            timed_out: false,
+                            truncated: false,
+                            combined: text,
+                            full_output_path: None,
+                        };
+                        sink.emit(Event::Observation {
+                            result: result.clone(),
+                        });
+                        self.history_append_observation(&result);
+                        return Ok((result.as_observation(), is_error));
+                    }
+                }
                 // Shell out to the local `web-search` CLI (searxng wrapper).
                 // Quoting via single-quotes + ' → '"'"' escape so an
                 // adversarial query can't break out of the argument.
@@ -2262,6 +2295,82 @@ changing files.";
 
 /// True when `path` (which may not exist yet) is inside `root`, after
 /// resolving symlinks and `..` on the part that exists.
+/// True when an executable named `name` is on PATH.
+fn command_on_path(name: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|dir| {
+        let p = dir.join(name);
+        p.is_file() || (cfg!(windows) && dir.join(format!("{name}.exe")).is_file())
+    })
+}
+
+/// `POST {base}/api/v1/search` with the paired device token, formatted like
+/// the local `web-search` CLI's output so the model reads one shape.
+async fn kotonia_web_search(base: &str, query: &str, max_results: usize) -> Result<String, String> {
+    let key =
+        std::env::var("KOTONIA_API_KEY").map_err(|_| "not logged in to kotonia.ai".to_string())?;
+    let url = format!("{}/api/v1/search", base.trim_end_matches('/'));
+    let response = reqwest::Client::new()
+        .post(&url)
+        .bearer_auth(key)
+        .timeout(std::time::Duration::from_secs(30))
+        .json(&serde_json::json!({"query": query, "max_results": max_results}))
+        .send()
+        .await
+        .map_err(|e| format!("search request failed: {e}"))?;
+    let status = response.status();
+    let body = response.text().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(format!(
+            "search failed ({status}): {}",
+            body.chars().take(300).collect::<String>()
+        ));
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("bad search response: {e}"))?;
+    Ok(format_search_results(&value))
+}
+
+fn format_search_results(value: &serde_json::Value) -> String {
+    let results = value
+        .get("results")
+        .and_then(|r| r.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if results.is_empty() {
+        return "No results.".to_string();
+    }
+    let mut out = String::new();
+    for (i, r) in results.iter().enumerate() {
+        let field = |k: &str| {
+            r.get(k)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        };
+        out.push_str(&format!(
+            "{}. {}\n   {}\n",
+            i + 1,
+            field("title"),
+            field("url")
+        ));
+        let snippet = field("snippet");
+        if !snippet.is_empty() {
+            out.push_str(&format!("   {snippet}\n"));
+        }
+    }
+    if let (Some(used), Some(limit)) = (
+        value.get("daily_used").and_then(|v| v.as_i64()),
+        value.get("daily_limit").and_then(|v| v.as_i64()),
+    ) {
+        out.push_str(&format!("(searches today: {used}/{limit})\n"));
+    }
+    out
+}
+
 fn is_within(path: &Path, root: &Path) -> bool {
     let Ok(root) = std::fs::canonicalize(root) else {
         return false;
@@ -2536,6 +2645,27 @@ impl std::error::Error for AgentError {}
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn api_search_results_read_like_the_cli() {
+        let v = serde_json::json!({
+            "results": [
+                {"title": "Tokio timeout", "url": "https://docs.rs/x", "snippet": "Create a Timeout"},
+                {"title": "B", "url": "https://b", "snippet": ""}
+            ],
+            "daily_used": 3, "daily_limit": 20
+        });
+        let out = format_search_results(&v);
+        assert!(
+            out.starts_with("1. Tokio timeout\n   https://docs.rs/x\n   Create a Timeout\n2. B\n")
+        );
+        assert!(out.ends_with("(searches today: 3/20)\n"));
+        assert_eq!(
+            format_search_results(&serde_json::json!({"results": []})),
+            "No results."
+        );
+    }
+
     use super::*;
     use serde_json::json;
 
