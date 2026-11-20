@@ -6,6 +6,7 @@ pub mod compaction;
 pub mod dispatch;
 pub mod edit;
 pub mod history;
+pub mod judge;
 pub mod parse;
 pub mod prompt;
 pub mod provider;

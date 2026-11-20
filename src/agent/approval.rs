@@ -4,6 +4,10 @@
 //! - `All`       : every command is gated. Sleep-tier safety.
 //! - `Allowlist` : known-safe families auto-pass, anything destructive or
 //!                 unknown gets gated. The pragmatic default.
+//! - `Smart`     : the allowlist, but whatever it would ask about — and any
+//!                 command that names a path outside the workspace — goes to
+//!                 a model's safety review first (`super::judge`). The user
+//!                 is asked only when the review says so.
 //! - `Auto`      : no gating. For automation and self-driving runs.
 //!
 //! Detection is intentionally conservative: false negatives are dangerous,
@@ -17,6 +21,7 @@ use std::fmt;
 pub enum ApprovalMode {
     All,
     Allowlist,
+    Smart,
     Auto,
 }
 
@@ -25,6 +30,7 @@ impl ApprovalMode {
         match s.to_ascii_lowercase().as_str() {
             "all" | "ask" => Some(ApprovalMode::All),
             "allowlist" | "default" => Some(ApprovalMode::Allowlist),
+            "smart" => Some(ApprovalMode::Smart),
             "auto" | "yolo" | "full-auto" => Some(ApprovalMode::Auto),
             _ => None,
         }
@@ -36,6 +42,7 @@ impl fmt::Display for ApprovalMode {
         match self {
             ApprovalMode::All => f.write_str("all"),
             ApprovalMode::Allowlist => f.write_str("allowlist"),
+            ApprovalMode::Smart => f.write_str("smart"),
             ApprovalMode::Auto => f.write_str("auto"),
         }
     }
@@ -70,8 +77,69 @@ pub fn decide(mode: ApprovalMode, command: &str) -> Decision {
         ApprovalMode::All => Decision::AskUser {
             reason: "approval mode = all".to_string(),
         },
-        ApprovalMode::Allowlist => allowlist_decide(command),
+        // Smart starts from the allowlist's answer; the agent sends the
+        // asks (and outside-the-workspace reads) to the safety review.
+        ApprovalMode::Allowlist | ApprovalMode::Smart => allowlist_decide(command),
     }
+}
+
+/// Why the allowlist's ask is about sending data out, if it is. After
+/// outside text (a web page, mail) entered the conversation, smart mode does
+/// not let the review wave these through: an injected instruction is
+/// exactly what would make the agent post data somewhere.
+pub fn is_egress_reason(reason: &str) -> bool {
+    reason.starts_with("network egress")
+        || reason == "raw network connection"
+        || reason == "pipe to shell"
+}
+
+/// True when a word of the command names a path outside `workspace`: the
+/// home directory (`~`, `$HOME`), a parent (`..`), or an absolute path not
+/// under the workspace. The allowlist passes `cat ~/.ssh/id_rsa` because
+/// `cat` is safe; smart mode sends such commands to the review instead.
+/// A plain word scan, not a shell parser — it only has to err toward
+/// reviewing, which costs a second, never toward skipping it.
+pub fn reaches_outside(command: &str, workspace: &std::path::Path) -> bool {
+    const HARMLESS: &[&str] = &[
+        "/dev/null",
+        "/dev/stdin",
+        "/dev/stdout",
+        "/dev/stderr",
+        "/dev/tty",
+        "/dev/zero",
+        "/dev/urandom",
+    ];
+    let ws = workspace.to_string_lossy();
+    let ws = ws.trim_end_matches('/');
+    let words = command.split(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '\'' | '"' | '=' | '(' | ')' | ';' | '|' | '&' | '<' | '>' | ',' | '`'
+            )
+    });
+    for w in words {
+        if w.is_empty() {
+            continue;
+        }
+        if w.starts_with('~') || w.contains("$HOME") || w.contains("${HOME}") {
+            return true;
+        }
+        if w == ".." || w.starts_with("../") || w.contains("/../") || w.ends_with("/..") {
+            return true;
+        }
+        if w.starts_with('/') {
+            // URLs split at ':' are not paths; `https://x/y` has no leading '/'.
+            if HARMLESS.iter().any(|h| w == *h) {
+                continue;
+            }
+            if !ws.is_empty() && (w == ws || w.starts_with(&format!("{ws}/"))) {
+                continue;
+            }
+            return true;
+        }
+    }
+    false
 }
 
 fn allowlist_decide(command: &str) -> Decision {
@@ -583,5 +651,54 @@ mod tests {
             decide(ApprovalMode::Allowlist, "grep 'foo; bar' README.md"),
             Decision::Allow
         );
+    }
+
+    #[test]
+    fn smart_starts_from_the_allowlist_and_keeps_the_vault_refusal() {
+        assert_eq!(ApprovalMode::parse("smart"), Some(ApprovalMode::Smart));
+        assert_eq!(ApprovalMode::Smart.to_string(), "smart");
+        assert_eq!(decide(ApprovalMode::Smart, "ls"), Decision::Allow);
+        assert!(matches!(
+            decide(ApprovalMode::Smart, "curl https://example.com"),
+            Decision::AskUser { .. }
+        ));
+        assert!(matches!(
+            decide(ApprovalMode::Smart, "cat ~/.kotonia/vault/mail.json"),
+            Decision::Refuse { .. }
+        ));
+    }
+
+    #[test]
+    fn outside_paths_are_noticed() {
+        let ws = std::path::Path::new("/home/u/proj");
+        for cmd in [
+            "cat ~/.ssh/id_rsa",
+            "ls $HOME/Downloads",
+            "grep -r token ..",
+            "head ../secret.txt",
+            "find / -name '*.csv'",
+            "cat /etc/passwd",
+            "ls /home/u/projector",
+            "python3 -c \"open('/home/u/.aws/credentials')\"",
+        ] {
+            assert!(reaches_outside(cmd, ws), "{cmd}");
+        }
+        for cmd in [
+            "ls",
+            "cat src/main.rs",
+            "cat /home/u/proj/README.md",
+            "grep foo . 2>/dev/null",
+            "curl -s https://api.github.com/repos/x/y",
+            "echo a=b",
+        ] {
+            assert!(!reaches_outside(cmd, ws), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn egress_reasons() {
+        assert!(is_egress_reason("network egress (curl)"));
+        assert!(is_egress_reason("pipe to shell"));
+        assert!(!is_egress_reason("sudo escalation"));
     }
 }

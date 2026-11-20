@@ -89,6 +89,14 @@ impl DispatchAgent {
         }
     }
 
+    /// Set the approval mode for the next turn. The Claude Code engine has
+    /// its own permission handling, so this does nothing there.
+    pub fn set_approval(&mut self, mode: crate::agent::approval::ApprovalMode) {
+        if let Self::ReAct(a) = self {
+            a.set_approval(mode);
+        }
+    }
+
     /// Run one user turn. `approval` is ignored by the Claude Code engine —
     /// that subprocess runs with `--dangerously-skip-permissions` so the
     /// host's approval policy doesn't gate it. (Future stages can hand

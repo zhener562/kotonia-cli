@@ -175,7 +175,7 @@ kotonia-cli --resume 20260624-1530-ab12
 | フラグ | 既定 | 説明 |
 |---|---|---|
 | `--model <id>` | `deepseek-v4-flash` | バックエンド選択（**既定はローカル :8898。立ってないと接続エラー**） |
-| `--approval all\|allowlist\|auto` | `allowlist` | コマンド承認の厳しさ |
+| `--approval all\|allowlist\|smart\|auto` | `allowlist` | コマンド承認の厳しさ |
 | `--in-place` | off | worktree を作らず cwd で直接作業（既定は `/tmp/kotonia-agent-*` に隔離） |
 | `--keep-worktree` | off | 終了後も worktree を残す（手動 merge 用） |
 | `--no-history` | off | セッションログを書かない |
@@ -187,6 +187,11 @@ kotonia-cli --resume 20260624-1530-ab12
 - **allowlist**（既定）… 読み取り/ビルド/テスト系は無確認、破壊的操作は確認。
   ⚠️ `python`/`node`/`cargo`/`make` 等は「安全」扱いで**無確認実行**になる（＝任意コード実行）。
   信用できないタスクでは `--approval all` を使うこと。
+- **smart** … allowlist で確認が要るコマンドと、作業フォルダ外のパス（`~`・`..`・絶対パス）を
+  含むコマンドを、エージェントと同じモデルに安全確認させる。確認を求めるのは判定が「聞く」の
+  ときだけ。「止める」は実行せず理由をエージェントに返す。保管庫・記憶ファイルの拒否が先に効き、
+  判定では覆せない。判定がタイムアウト・読めないときは確認に倒す。Web ページやメールを読んだ後は、
+  外へ送る命令（`curl`/`wget`/`| sh`）は判定に関わらず確認する。
 - **auto** … 一切確認しない。使い捨て環境専用。
 
 ### worktree の流れ（既定）

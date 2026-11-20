@@ -27,9 +27,10 @@ use serde::Serialize;
 use crate::ai::{AiCallOptions, AiContent, AiMessage, AiRole, AiStopReason, AiTool, AiToolChoice};
 use crate::execution::host::{ExecutionResult, HostExecutor};
 
-use super::approval::{decide, ApprovalMode, Decision};
+use super::approval::{decide, is_egress_reason, reaches_outside, ApprovalMode, Decision};
 use super::compaction;
 use super::history::HistoryStore;
+use super::judge;
 use super::parse::{parse, Action};
 use super::prompt::{system_prompt, system_prompt_native};
 use super::provider::{ChatMsg, ChatRole, Provider};
@@ -277,6 +278,10 @@ pub struct Agent {
     /// From then on, memory writes ask the user first: that text could
     /// otherwise plant an instruction that every later session obeys.
     tainted: Option<&'static str>,
+    /// The user's message that started the current turn. The smart
+    /// approval mode shows it to the safety review, which judges a command
+    /// against what was asked.
+    turn_request: String,
     browser: super::browser::Browser,
 }
 
@@ -297,6 +302,17 @@ impl MailAccess {
 }
 
 impl Agent {
+    /// Change the approval mode from the next command on. kotonia-desktop
+    /// keeps one agent per session and lets the user flip the mode between
+    /// turns.
+    pub fn set_approval(&mut self, mode: ApprovalMode) {
+        self.config.approval = mode;
+    }
+
+    pub fn approval(&self) -> ApprovalMode {
+        self.config.approval
+    }
+
     pub fn new(workspace_root: &Path, provider: Provider, config: AgentConfig) -> Self {
         let executor = HostExecutor::new(workspace_root.to_path_buf());
         let native_mode = provider.supports_native_tools() && !config.force_delimiter;
@@ -400,6 +416,7 @@ impl Agent {
             memory_base,
             mail_access,
             tainted: None,
+            turn_request: String::new(),
             browser: super::browser::Browser::default(),
         }
     }
@@ -464,6 +481,50 @@ impl Agent {
             });
         }
         None
+    }
+
+    /// The approval decision for one bash command: the fixed refusals, then
+    /// the mode's policy, then — in smart mode — the safety review for
+    /// anything the allowlist would ask about or that reaches outside the
+    /// workspace.
+    async fn gate_bash(&self, command: &str) -> Decision {
+        if let Some(reason) = self.bash_refusal(command) {
+            return Decision::Refuse { reason };
+        }
+        let decision = decide(self.config.approval, command);
+        if self.config.approval != ApprovalMode::Smart {
+            return decision;
+        }
+        match &decision {
+            Decision::Refuse { .. } => return decision,
+            Decision::Allow if !reaches_outside(command, self.executor.cwd()) => return decision,
+            // Outside text is in the conversation: sending data out stays
+            // the user's call, whatever the review thinks.
+            Decision::AskUser { reason } if self.tainted.is_some() && is_egress_reason(reason) => {
+                return decision
+            }
+            _ => {}
+        }
+        match judge::review(
+            &self.provider,
+            &self.turn_request,
+            self.executor.cwd(),
+            command,
+        )
+        .await
+        {
+            judge::Verdict::Allow => Decision::Allow,
+            judge::Verdict::Ask(reason) => Decision::AskUser {
+                reason: format!("safety review: {reason}"),
+            },
+            judge::Verdict::Deny(reason) => Decision::Refuse {
+                reason: format!(
+                    "the safety review refused it ({}). If the user really wants it, they can \
+                     switch the approval mode to `allowlist`, which asks instead",
+                    reason.trim_end_matches(['.', '。'])
+                ),
+            },
+        }
     }
 
     /// Remember that outside text entered the conversation.
@@ -577,6 +638,7 @@ impl Agent {
         approval: &mut dyn ApprovalHandler,
         sink: &mut dyn EventSink,
     ) -> Result<String, AgentError> {
+        self.turn_request = task.to_string();
         self.history_turn_start();
         self.cancel.store(false, Ordering::SeqCst);
         self.turn_start_chat = self.messages.len();
@@ -623,10 +685,7 @@ impl Agent {
                     return Ok(answer);
                 }
                 Action::Bash(command) => {
-                    let decision = match self.bash_refusal(&command) {
-                        Some(reason) => Decision::Refuse { reason },
-                        None => decide(self.config.approval, &command),
-                    };
+                    let decision = self.gate_bash(&command).await;
                     if fetches_outside_text(&command) {
                         self.note_untrusted_input("a shell download");
                     }
@@ -732,6 +791,7 @@ impl Agent {
         approval: &mut dyn ApprovalHandler,
         sink: &mut dyn EventSink,
     ) -> Result<String, AgentError> {
+        self.turn_request = task.to_string();
         self.history_turn_start();
         self.cancel.store(false, Ordering::SeqCst);
         self.hydrate_native_from_messages();
@@ -1210,10 +1270,7 @@ complete arguments; if you were writing a long script, write it in smaller steps
                 if command.trim().is_empty() {
                     return Ok(("bash tool called with empty `command`".into(), true));
                 }
-                let decision = match self.bash_refusal(&command) {
-                    Some(reason) => Decision::Refuse { reason },
-                    None => decide(self.config.approval, &command),
-                };
+                let decision = self.gate_bash(&command).await;
                 if fetches_outside_text(&command) {
                     self.note_untrusted_input("a shell download");
                 }
@@ -1725,8 +1782,14 @@ complete arguments; if you were writing a long script, write it in smaller steps
         let ask = match self.config.approval {
             ApprovalMode::Auto => None,
             ApprovalMode::All => Some("approval mode = all".to_string()),
-            ApprovalMode::Allowlist if is_within(&path, self.executor.cwd()) => None,
-            ApprovalMode::Allowlist => Some("edit outside the workspace".to_string()),
+            ApprovalMode::Allowlist | ApprovalMode::Smart
+                if is_within(&path, self.executor.cwd()) =>
+            {
+                None
+            }
+            ApprovalMode::Allowlist | ApprovalMode::Smart => {
+                Some("edit outside the workspace".to_string())
+            }
         };
         if let Some(reason) = ask {
             if approval.ask(&label, &reason) != ApprovalOutcome::Approve {

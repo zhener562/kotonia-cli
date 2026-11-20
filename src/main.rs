@@ -383,7 +383,7 @@ struct DaemonArgs {
     #[arg(long, default_value = "react")]
     engine: String,
 
-    /// Approval policy. `all` / `allowlist` (default) / `auto`.
+    /// Approval policy. `all` / `allowlist` (default) / `smart` / `auto`.
     #[arg(long, default_value = "allowlist")]
     approval: String,
 
@@ -431,7 +431,9 @@ struct RunArgs {
 
     /// Approval mode: `all` gates every command, `allowlist` (default) auto-runs
     /// read-only / build / test families and gates anything destructive,
-    /// `auto` runs everything without asking.
+    /// `smart` sends what the allowlist would ask about to a model's safety
+    /// review and asks only when it says so, `auto` runs everything without
+    /// asking.
     #[arg(short, long, default_value = "allowlist")]
     approval: String,
 
@@ -560,7 +562,7 @@ async fn real_main() -> ExitCode {
         Some(m) => m,
         None => {
             eprintln!(
-                "kotonia-cli: unknown approval mode `{}` (expected all|allowlist|auto)",
+                "kotonia-cli: unknown approval mode `{}` (expected all|allowlist|smart|auto)",
                 cli.approval
             );
             telemetry::fail("bad_args");
@@ -1493,7 +1495,7 @@ async fn run_daemon(args: DaemonArgs) -> ExitCode {
         Some(m) => m,
         None => {
             eprintln!(
-                "kotonia-cli daemon: unknown approval mode `{}` (expected all|allowlist|auto)",
+                "kotonia-cli daemon: unknown approval mode `{}` (expected all|allowlist|smart|auto)",
                 args.approval
             );
             return ExitCode::from(2);

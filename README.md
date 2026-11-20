@@ -348,6 +348,17 @@ engine. The Claude Code engine ignores this and runs with
 - **`allowlist`** (default) — read-only / build / test families run
   silently; anything destructive (`rm`, `git push --force`, `curl`, …)
   asks first.
+- **`smart`** — the allowlist, but whatever it would ask about (and any
+  command that names a path outside the workspace, such as `~` or `..`)
+  first goes to a safety review by the same model the agent uses. It sees
+  your request, the workspace and the full command, and answers allow /
+  ask / deny. You are asked only when it says *ask*; *deny* is refused and
+  the agent is told why. The vault and memory-file refusals still come
+  first and the review cannot override them. A review that times out or
+  cannot be read falls back to asking. After the agent has read a web page
+  or mail, commands that send data out (`curl`, `wget`, `| sh`) are asked
+  about regardless of the review. Each review is one short model call
+  (about 0.6 s against `kotonia-llm-basic`) and counts toward your usage.
 - **`auto`** — never ask. Dangerous; use only with `--in-place=false`
   (the default — see below).
 
