@@ -125,6 +125,24 @@ impl Provider {
         true
     }
 
+    /// Only the hosted local API advertises the constrained action adapter.
+    /// Cloud and user-defined providers keep their native tool transport.
+    pub fn supports_grammar_sampling(&self) -> bool {
+        self.spec.name == "kotonia"
+            && matches!(
+                self.canonical_model.as_str(),
+                "kotonia-llm" | "kotonia-llm-basic"
+            )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_local_endpoint(base: String) -> Self {
+        let mut provider = Self::for_model("kotonia-llm-basic").unwrap();
+        provider.spec.base_url = base;
+        provider.spec.api_key = Some("synthetic-test".into());
+        provider
+    }
+
     fn require_api_key(&self) -> Result<String, ProviderError> {
         self.spec.api_key.clone().ok_or_else(|| {
             let hint = match self.spec.name.as_str() {

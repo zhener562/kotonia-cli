@@ -204,6 +204,13 @@ pub struct AgentConfig {
     /// daemon, kotonia-desktop — gets it from here rather than wiring it
     /// itself. Skipped when the workspace is the home directory.
     pub project_memory: bool,
+    /// Optional structured final-answer value (e.g. Desktop response blocks).
+    /// Plain CLI answers remain strings. Hosted local models also constrain
+    /// action selection and arguments with API grammar sampling.
+    pub final_answer_schema: Option<serde_json::Value>,
+    /// Frontend-specific semantic checks before a final answer is delivered.
+    /// An error becomes a tool result so the model can correct its response.
+    pub final_answer_validator: Option<fn(&serde_json::Value) -> Result<(), String>>,
 }
 
 impl AgentConfig {
@@ -219,6 +226,8 @@ impl AgentConfig {
             connectors: false,
             unattended: false,
             project_memory: true,
+            final_answer_schema: None,
+            final_answer_validator: None,
         }
     }
 }
@@ -380,6 +389,14 @@ impl Agent {
         let messages = vec![ChatMsg::system(system_prompt_text.clone())];
         let tool_catalog = if native_mode {
             let mut tools = build_tool_catalog();
+            if let Some(schema) = &config.final_answer_schema {
+                let final_tool = tools
+                    .iter_mut()
+                    .find(|tool| tool.name == "final_answer")
+                    .unwrap();
+                final_tool.input_schema["properties"]["answer"] = schema.clone();
+                final_tool.input_schema["additionalProperties"] = serde_json::json!(false);
+            }
             if !config.unattended {
                 tools.push(super::browser::tool());
             }
@@ -674,6 +691,12 @@ impl Agent {
 
             match parse(&assistant_text) {
                 Action::Final(answer) => {
+                    if let Some(error) = self.config.final_answer_validator.and_then(|validate| {
+                        validate(&serde_json::Value::String(answer.clone())).err()
+                    }) {
+                        self.push_logged(ChatMsg::user(error));
+                        continue;
+                    }
                     sink.emit(Event::Final {
                         answer: answer.clone(),
                     });
@@ -830,6 +853,18 @@ impl Agent {
                 }
             };
 
+            if self.config.final_answer_schema.is_some()
+                && matches!(response.stop_reason, AiStopReason::MaxTokens)
+            {
+                let message = "model hit max_tokens before completing the structured final answer"
+                    .to_string();
+                sink.emit(Event::Error {
+                    message: message.clone(),
+                });
+                self.history_turn_end(iter, false);
+                return Err(AgentError::Llm(message));
+            }
+
             // Record the assistant turn in both the native log (full
             // content blocks) and the legacy ChatMsg log (text summary)
             // so resume keeps working.
@@ -858,8 +893,17 @@ impl Agent {
                 .find(|(_, name, _)| name == "final_answer")
                 .map(|(id, _, input)| (id.clone(), input.clone()))
             {
-                match final_answer_text(&final_input, &response.text()) {
-                    Some(answer) => {
+                let answer = final_answer_for_schema(
+                    &final_input,
+                    self.config.final_answer_schema.is_some(),
+                    &response.text(),
+                );
+                let validation_error = self
+                    .config
+                    .final_answer_validator
+                    .and_then(|validate| validate(&final_input["answer"]).err());
+                match answer {
+                    Some(answer) if validation_error.is_none() => {
                         let mut blocks: Vec<AiContent> = Vec::new();
                         for (id, name, _) in &tool_uses {
                             let content = if *id == final_id {
@@ -887,16 +931,15 @@ impl Agent {
                         self.history_turn_end(iter, true);
                         return Ok(answer);
                     }
-                    None => {
-                        // Empty answer — bounce it back instead of ending
+                    _ => {
+                        // Invalid or empty answer — bounce it back instead of ending
                         // the turn with nothing to show the operator.
                         let blocks: Vec<AiContent> = tool_uses
                             .iter()
                             .map(|(id, _, _)| AiContent::ToolResult {
                                 tool_use_id: id.clone(),
-                                content: "final_answer called with empty `answer` — \
-                                          call it again with the actual answer text"
-                                    .to_string(),
+                                content: validation_error.clone().unwrap_or_else(||
+                                    "final_answer called with empty `answer` — call it again with the actual answer text".to_string()),
                                 is_error: true,
                             })
                             .collect();
@@ -915,6 +958,14 @@ impl Agent {
                 // `auto`. Treat the text as the final answer (graceful
                 // degradation, same contract as before `final_answer`).
                 let answer = response.text();
+                if let Some(error) = self
+                    .config
+                    .final_answer_validator
+                    .and_then(|validate| validate(&serde_json::Value::String(answer.clone())).err())
+                {
+                    self.native_messages.push(AiMessage::user_text(error));
+                    continue;
+                }
                 if let AiStopReason::MaxTokens = response.stop_reason {
                     sink.emit(Event::Error {
                         message: "model hit max_tokens before issuing tool_call or finishing"
@@ -1130,14 +1181,18 @@ impl Agent {
         &mut self,
     ) -> Result<crate::ai::AiResponse, super::provider::ProviderError> {
         let build_options = |required: bool, this: &Self| {
-            AiCallOptions::new(this.provider.model_id().to_string(), this.config.max_tokens)
-                .with_system(this.system_prompt.clone())
-                .with_tools(this.tool_catalog.clone())
-                .with_tool_choice(if required {
-                    AiToolChoice::Any
-                } else {
-                    AiToolChoice::Auto
-                })
+            let mut options =
+                AiCallOptions::new(this.provider.model_id().to_string(), this.config.max_tokens)
+                    .with_system(this.system_prompt.clone())
+                    .with_tools(this.tool_catalog.clone())
+                    .with_tool_choice(if required {
+                        AiToolChoice::Any
+                    } else {
+                        AiToolChoice::Auto
+                    });
+            options.grammar_sampling = this.config.final_answer_schema.is_some()
+                && this.provider.supports_grammar_sampling();
+            options
         };
         let options = build_options(self.tool_choice_required, self);
         let result = self
@@ -2060,6 +2115,22 @@ fn shell_single_quote(s: &str) -> String {
 /// the assistant's prose content when the `answer` argument is missing or
 /// blank (some models put the text in content and call the tool with `{}`).
 /// Returns `None` when both are empty — the loop bounces an error back.
+fn final_answer_for_schema(
+    input: &serde_json::Value,
+    structured: bool,
+    prose: &str,
+) -> Option<String> {
+    if structured
+        && input
+            .get("answer")
+            .is_some_and(serde_json::Value::is_object)
+    {
+        serde_json::to_string(&input["answer"]).ok()
+    } else {
+        final_answer_text(input, prose)
+    }
+}
+
 fn final_answer_text(input: &serde_json::Value, prose_fallback: &str) -> Option<String> {
     let arg = input
         .get("answer")
@@ -2718,6 +2789,106 @@ mod tests {
         assert_eq!(sniff_image_media_type(br#"{"created":1,"data":[{"#), None);
         assert_eq!(sniff_image_media_type(b""), None);
         assert_eq!(sniff_image_media_type(b"RIFF\0\0\0\0AVI "), None);
+    }
+
+    #[tokio::test]
+    async fn rejected_structured_final_answer_is_corrected_before_delivery() {
+        use std::io::{BufRead, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let thread = std::thread::spawn(move || {
+            for accepted in [false, true] {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse::<usize>().unwrap();
+                        }
+                    }
+                }
+                let mut bytes = vec![0; length];
+                reader.read_exact(&mut bytes).unwrap();
+                let request: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(request["grammar_sampling"], true);
+                if accepted {
+                    assert_eq!(
+                        request["messages"].as_array().unwrap().last().unwrap()["role"],
+                        "tool"
+                    );
+                    assert!(
+                        request["messages"].as_array().unwrap().last().unwrap()["content"]
+                            .as_str()
+                            .unwrap()
+                            .contains("not accepted")
+                    );
+                }
+                let body=json!({"choices":[{"message":{"role":"assistant","tool_calls":[{
+                    "id":if accepted {"call_2"}else{"call_1"},"type":"function","function":{
+                        "name":"final_answer","arguments":json!({"answer":{"accepted":accepted}}).to_string()
+                    }}]},"finish_reason":"tool_calls"}]}).to_string();
+                write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = AgentConfig::new(ApprovalMode::Allowlist, true);
+        config.project_memory = false;
+        config.unattended = true;
+        config.final_answer_schema = Some(
+            json!({"type":"object","properties":{"accepted":{"type":"boolean"}},"required":["accepted"]}),
+        );
+        config.final_answer_validator = Some(|value| {
+            if value["accepted"] == true {
+                Ok(())
+            } else {
+                Err("not accepted; correct the answer".into())
+            }
+        });
+        let mut agent = Agent::new(dir.path(), Provider::test_local_endpoint(base), config);
+        let mut events = BrowserEvents(Vec::new());
+        let answer = agent
+            .run_turn("synthetic test", &mut DenyBrowser { asked: 0 }, &mut events)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&answer).unwrap(),
+            json!({"accepted":true})
+        );
+        assert_eq!(
+            events
+                .0
+                .iter()
+                .filter(|e| matches!(e, Event::Final { .. }))
+                .count(),
+            1
+        );
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn structured_final_answer_preserves_blocks_without_double_encoding() {
+        let input = json!({"answer":{"version":1,"blocks":[
+            {"type":"speech","speaker":"Eve","text":"完了しました。"},
+            {"type":"artifact","text":"A quote: \" and a newline: \n"}
+        ]}});
+        let text = final_answer_for_schema(&input, true, "").unwrap();
+        let decoded: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(decoded, input["answer"]);
+        assert!(final_answer_for_schema(&input, false, "").is_none());
+        // Legacy providers and session histories can still return strings.
+        assert_eq!(
+            final_answer_for_schema(&json!({"answer":"legacy"}), true, ""),
+            Some("legacy".into())
+        );
     }
 
     #[test]

@@ -101,8 +101,9 @@ impl AiMessage {
     }
 }
 
-/// Tool definition advertised to the model. `input_schema` is JSON Schema —
-/// keep within the OpenAPI 3.0 subset (no `$ref`, no `oneOf`/`anyOf`).
+/// Tool definition advertised to the model. `input_schema` is JSON Schema.
+/// Provider support varies; Kotonia GBS supports nested `anyOf` and finite
+/// local references. Keep schemas portable when using other providers.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct AiTool {
     pub name: String,
@@ -186,6 +187,8 @@ pub struct AiCallOptions {
     pub system: Option<String>,
     pub tools: Vec<AiTool>,
     pub tool_choice: AiToolChoice,
+    /// Opt into Kotonia API grammar-constrained tool generation.
+    pub grammar_sampling: bool,
 }
 
 impl AiCallOptions {
@@ -196,6 +199,7 @@ impl AiCallOptions {
             system: None,
             tools: Vec::new(),
             tool_choice: AiToolChoice::default(),
+            grammar_sampling: false,
         }
     }
 

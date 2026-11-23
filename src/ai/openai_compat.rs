@@ -123,6 +123,9 @@ fn build_request_body(
             tool_choice_to_wire(&options.tool_choice),
         );
     }
+    if options.grammar_sampling {
+        body.insert("grammar_sampling".into(), json!(true));
+    }
     for (key, value) in config.extra_body {
         body.insert(key, value);
     }
@@ -473,6 +476,17 @@ fn unparsed(raw: &str) -> Value {
 #[cfg(test)]
 mod argument_tests {
     use super::*;
+
+    #[test]
+    fn grammar_sampling_is_explicit_on_the_wire() {
+        let config = OpenAiCompatConfig::new("http://localhost", "test", MaxTokensParam::MaxTokens);
+        let mut options = AiCallOptions::new("model", 100);
+        let normal = build_request_body(config.clone(), vec![], options.clone()).unwrap();
+        assert!(normal.get("grammar_sampling").is_none());
+        options.grammar_sampling = true;
+        let constrained = build_request_body(config, vec![], options).unwrap();
+        assert_eq!(constrained["grammar_sampling"], true);
+    }
 
     #[test]
     fn arguments_are_always_an_object() {
